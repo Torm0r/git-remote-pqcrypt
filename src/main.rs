@@ -4,6 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd}; // Import FromRawFd trait
 use std::thread;
 
+mod types;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     eprintln!(

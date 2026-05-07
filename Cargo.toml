@@ -6,3 +6,8 @@ edition = "2021"
 [[bin]]
 name = "git-remote-debug"
 path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.28", features = ["derive"] }
+serde_json = "1.0"
+sha1-checked = "0.10.0"

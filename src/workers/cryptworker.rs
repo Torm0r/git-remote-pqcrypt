@@ -1,97 +1,137 @@
+use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use rand::{rngs::OsRng, RngCore};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use zeroize::Zeroizing;
 
-/// Flag to dictate the operation
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CryptoMode {
     Encrypt,
     Decrypt,
 }
 
-/// Pipes data from ANY reader to ANY writer, using ChaCha20-Poly1305.
-/// Memory usage is fixed at ~4KB, allowing it to encrypt/decrypt massive files.
+const CHUNK_SIZE: usize = 64 * 1024;
+// XChaCha20 streaming uses a 19-byte nonce (24 bytes total - 5 bytes for the stream counter)
+const STREAM_NONCE_SIZE: usize = 19;
+// Poly1305 auth tag added to every chunk
+const TAG_SIZE: usize = 16;
+
 pub fn pipe_crypto<R: Read, W: Write>(
     mut source: R,
     mut dest: W,
-    key: &Key,
+    key: &[u8],
     mode: CryptoMode,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // The STREAM construction requires a 19-byte nonce.
-    let mut nonce_bytes = [0u8; 19];
+) -> Result<()> {
+    if key.len() != 32 {
+        return Err(anyhow!("Key must be exactly 32 bytes"));
+    }
 
-    // We initialize the underlying cipher with our Master Key
-    let aead = XChaCha20Poly1305::new(key);
-
-    // We process the file in 4KB chunks
-    let mut buffer = [0u8; 65536];
+    let cipher_key = Key::from_slice(key);
+    let aead = XChaCha20Poly1305::new(cipher_key);
+    let mut nonce_bytes = [0u8; STREAM_NONCE_SIZE];
 
     match mode {
         CryptoMode::Encrypt => {
-            // 1. Generate a random nonce specifically for this file
+            // 1. Generate ONE nonce for the entire stream
             OsRng.fill_bytes(&mut nonce_bytes);
-
-            // 2. Write the 7-byte nonce to the very beginning of the destination file
-            // so we know what it is when we need to decrypt it later.
             dest.write_all(&nonce_bytes)?;
 
-            // 3. Setup the streaming encryptor
             let mut encryptor = EncryptorBE32::from_aead(aead, nonce_bytes.as_ref().into());
+            let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
 
-            // 4. Stream the data!
             loop {
-                let read_count = source.read(&mut buffer)?;
+                // Safely fill the buffer to the brim, handling short reads
+                let read_count = read_up_to(&mut source, &mut buffer)?;
 
-                if read_count == buffer.len() {
-                    // Buffer is full, encrypt a standard block
+                if read_count == CHUNK_SIZE {
                     let ciphertext = encryptor
-                        .encrypt_next(buffer.as_slice())
-                        .map_err(|e| format!("Encryption error: {}", e))?;
+                        .encrypt_next(&buffer[..])
+                        .map_err(|e| anyhow!("Stream encryption error: {}", e))?;
                     dest.write_all(&ciphertext)?;
                 } else {
-                    // We hit the end of the file, encrypt the final partial block
+                    // We truly hit EOF. Encrypt the final partial block and exit.
                     let ciphertext = encryptor
                         .encrypt_last(&buffer[..read_count])
-                        .map_err(|e| format!("Encryption error: {}", e))?;
+                        .map_err(|e| anyhow!("Final block encryption error: {}", e))?;
                     dest.write_all(&ciphertext)?;
-                    break; // Exit the loop
+                    break;
                 }
             }
         }
 
         CryptoMode::Decrypt => {
-            // 1. Read the first 19 bytes from the source file to recover the nonce
-            source.read_exact(&mut nonce_bytes)?;
+            // 1. Read the ONE nonce from the top of the file
+            source
+                .read_exact(&mut nonce_bytes)
+                .map_err(|e| anyhow!("Failed to read stream nonce: {}", e))?;
 
-            // 2. Setup the streaming decryptor using that nonce
             let mut decryptor = DecryptorBE32::from_aead(aead, nonce_bytes.as_ref().into());
 
-            // 3. Stream the data!
-            // Note: Ciphertext blocks are 16 bytes larger than plaintext blocks because of MAC tags.
-            // So we read in chunks of 4096 + 16 = 4112 bytes.
-            let mut enc_buffer = [0u8; 65536 + 16];
+            // Ciphertext chunks are larger due to the MAC tag
+            let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + TAG_SIZE]);
 
             loop {
-                let read_count = source.read(&mut enc_buffer)?;
+                // Safely fill the buffer handling short reads
+                let read_count = read_up_to(&mut source, &mut buffer)?;
 
-                if read_count == enc_buffer.len() {
-                    // Buffer is full, decrypt a standard block
-                    let plaintext = decryptor
-                        .decrypt_next(enc_buffer.as_slice())
-                        .map_err(|e| format!("Decryption error (Corrupted file?): {}", e))?;
+                if read_count == CHUNK_SIZE + TAG_SIZE {
+                    let plaintext = Zeroizing::new(
+                        decryptor
+                            .decrypt_next(&buffer[..])
+                            .map_err(|e| anyhow!("Corrupted stream or bad key: {}", e))?,
+                    );
                     dest.write_all(&plaintext)?;
                 } else {
-                    // We hit the end of the file, decrypt the final partial block
-                    let plaintext = decryptor
-                        .decrypt_last(&enc_buffer[..read_count])
-                        .map_err(|e| format!("Decryption error (Corrupted file?): {}", e))?;
+                    // We truly hit EOF. Decrypt the final partial block and exit.
+                    let plaintext = Zeroizing::new(
+                        decryptor
+                            .decrypt_last(&buffer[..read_count])
+                            .map_err(|e| anyhow!("Corrupted EOF block or bad key: {}", e))?,
+                    );
                     dest.write_all(&plaintext)?;
-                    break; // Exit the loop
+                    break;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Helper: Forces Rust to keep reading until the buffer is full OR we hit true EOF.
+fn read_up_to<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match source.read(&mut buf[total..]) {
+            Ok(0) => break, // True EOF
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow!("I/O Read error: {}", e)),
+        }
+    }
+    Ok(total)
+}
+
+/// Encrypt bytes in-memory.
+pub fn encrypt_bytes(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe_crypto(
+        io::Cursor::new(plaintext),
+        &mut output,
+        key,
+        CryptoMode::Encrypt,
+    )?;
+    Ok(output)
+}
+
+/// Decrypt bytes in-memory.
+pub fn decrypt_bytes(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe_crypto(
+        io::Cursor::new(ciphertext),
+        &mut output,
+        key,
+        CryptoMode::Decrypt,
+    )?;
+    Ok(output)
 }

@@ -1,23 +1,35 @@
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
-// The `transparent` macro tells Serde: "When saving to JSON,
-// pretend this struct doesn't exist and just output the inner String."
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GitHash(String);
+
 impl GitHash {
-    // The ONLY way to create a GitHash. It enforces the rules.
-    pub fn new(hash: &str) -> Result<Self, &'static str> {
-        if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            Ok(Self(hash.to_string()))
-        } else {
-            Err("Invalid SHA-1 hash format! Must be 40 hex characters.")
+    pub fn new(s: String) -> Result<Self> {
+        // Git SHA-1 hashes are 40 hex characters
+        if s.len() != 40 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid Git SHA-1 hash format: {}", s));
         }
+        Ok(GitHash(s))
     }
 
-    // A helper to easily print it back to Git
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Display for GitHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for GitHash {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        GitHash::new(s.to_string())
     }
 }

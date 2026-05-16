@@ -1,102 +1,55 @@
 use std::env;
-use std::fs::File;
-use std::io::{self, BufRead, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd}; // Import FromRawFd trait
-use std::thread;
+use std::process;
 
+mod cli;
+mod storage;
 mod types;
+mod workers;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
-    eprintln!(
-        "[DEBUG] git-remote-debug invoked with arguments: {:?}",
-        args
-    );
 
-    // Open /dev/tty for user input
-    let tty_input = File::options()
-        .read(true)
-        .open("/dev/tty")
-        .expect("Failed to open /dev/tty. This tool requires a Unix-like terminal environment.");
+    // Git remote helper mode detection:
+    // Git invokes us as: `git-remote-pqcrypt <remote-name> <url>`
+    // where <remote-name> is something like "origin", never a known CLI subcommand.
+    // CLI mode uses: `git-remote-pqcrypt <subcommand> [args...]`
+    // Known CLI subcommands: init, add-user, keygen, help
+    let is_git_remote_helper = args.len() == 3
+        && args[2].starts_with("pqcrypt://")
+        && !matches!(args[1].as_str(), "init" | "add-user" | "keygen" | "help");
 
-    let tty_fd = tty_input.as_raw_fd();
-    let tty_reader = unsafe {
-        // SAFETY: We are creating a new File from an existing file descriptor.
-        // The original tty_input is moved into the thread, so there's no double close.
-        File::from_raw_fd(tty_fd)
-    };
+    if is_git_remote_helper {
+        let remote_url = &args[2];
+        let repo_path = remote_url.trim_start_matches("pqcrypt://");
 
-    let git_to_terminal_handle = thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut stdin_lock = stdin.lock();
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            match stdin_lock.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF reached, Git closed the connection
-                    eprintln!("[DEBUG] Git stdin EOF. Exiting thread A.");
-                    break;
-                }
-                Ok(_) => {
-                    eprint!("[GIT]  <- {}", line);
-                    io::stderr().flush().expect("Failed to flush stderr");
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                    // Git pipe disconnected, exit cleanly
-                    eprintln!("[DEBUG] Git stdin broken pipe. Exiting thread A.");
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to read from stdin: {}", e);
-                    break;
-                }
+        let storage = match storage::sftp::SftpStorage::new(repo_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: Failed to initialize storage: {}", e);
+                process::exit(1);
             }
-        }
-    });
+        };
 
-    let terminal_to_git_handle = thread::spawn(move || {
-        let mut stdout = io::stdout();
-        let mut tty_reader_buf = io::BufReader::new(tty_reader);
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            match tty_reader_buf.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF from TTY (Ctrl+D), user wants to terminate
-                    eprintln!("[DEBUG] TTY EOF. Exiting thread B.");
-                    break;
-                }
-                Ok(_) => {
-                    eprint!("[USER] -> {}", line);
-                    io::stderr().flush().expect("Failed to flush stderr");
-                    match stdout.write_all(line.as_bytes()) {
-                        Ok(_) => {
-                            stdout.flush().expect("Failed to flush stdout to Git");
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                            // Git pipe disconnected, exit cleanly
-                            eprintln!("[DEBUG] Git stdout broken pipe. Exiting thread B.");
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("[ERROR] Failed to write to stdout: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to read from /dev/tty: {}", e);
-                    break;
-                }
+        let key_worker = workers::keyworker::KeyWorker::new(storage.clone());
+        let master_key = match key_worker.unlock_master_key().await {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("error: Failed to unlock master key: {}", e);
+                process::exit(1);
             }
+        };
+
+        let mut git_worker = workers::gitworker::GitWorker::new(storage, master_key);
+        if let Err(e) = git_worker.run().await {
+            eprintln!("error: Git worker failed: {}", e);
+            process::exit(1);
         }
-    });
-
-    git_to_terminal_handle.join().expect("Thread A panicked");
-    terminal_to_git_handle.join().expect("Thread B panicked");
-
-    eprintln!("[DEBUG] git-remote-debug exiting cleanly.");
+    } else {
+        // Admin CLI mode
+        if let Err(e) = cli::parse_and_run().await {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
 }

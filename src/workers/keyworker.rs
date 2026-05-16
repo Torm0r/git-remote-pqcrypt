@@ -1,225 +1,178 @@
-//! Key management worker for X-Wing KEM-based repository key unlocking.
-//!
-//! The `keys.json` file contains a list of entries, each encapsulating the
-//! repository master key for a different user's X-Wing public key.
-//! The `KeyWorker` takes a user's private (decapsulation) key, scans the
-//! list, and returns the unlocked master key for the matching entry.
-//!
-//! ## On-disk format (`keys.json`)
-//! ```json
-//! {
-//!   "keys": [
-//!     {
-//!       "ciphertext": "<base64 X-Wing ciphertext, 1120 bytes raw>",
-//!       "encrypted_master_key": "<base64 nonce(24) + AEAD ciphertext(32+16)>"
-//!     }
-//!   ]
-//! }
-//! ```
-//!
-//! ## Unlocking flow
-//! 1. For each entry, decapsulate the X-Wing ciphertext with the user's private key
-//!    to derive a 32-byte shared secret.
-//! 2. Use that shared secret as an XChaCha20-Poly1305 key to AEAD-decrypt the
-//!    `encrypted_master_key` blob.
-//! 3. If AEAD authentication passes → the shared secret was correct → we found
-//!    our entry. Return the decrypted repo master key.
-//! 4. If authentication fails → wrong key for this entry, try the next one.
-
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chacha20poly1305::{
-    aead::{Aead, AeadCore},
-    Key, KeyInit, XChaCha20Poly1305,
-};
-use rand::rngs::OsRng;
+use anyhow::{anyhow, Result};
+use base64::prelude::*;
+use kem::{Decapsulate, Decapsulator, Encapsulate, KeyExport};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use x_wing::{
-    kem::{Decapsulate, Encapsulate},
-    DecapsulationKey, EncapsulationKey,
-};
+use std::env;
+use std::path::PathBuf;
 
-// ─── On-disk types ───────────────────────────────────────────────────────────
+use crate::storage::Storage;
+use crate::workers::cryptworker;
 
-/// A single entry in the key list: an X-Wing ciphertext paired with the
-/// repo master key encrypted under the derived shared secret.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyEntry {
-    /// Base64-encoded X-Wing ciphertext (1120 bytes raw).
-    pub ciphertext: String,
-    /// Base64-encoded nonce (24 bytes) + AEAD ciphertext (32 + 16 bytes).
-    pub encrypted_master_key: String,
+const ENV_KEY_PATH: &str = "PQCRYPT_KEY_PATH";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeysJson {
+    #[serde(rename = "masterKey")]
+    pub master_key_encapsulations: Vec<KeyEncapsulation>,
 }
 
-/// The on-disk format of `keys.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyFile {
-    pub keys: Vec<KeyEntry>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyEncapsulation {
+    #[serde(rename = "publicKey")]
+    pub public_key: String, // Base64 encoded X-Wing public key
+    #[serde(rename = "encapsulatedKey")]
+    pub encapsulated_key: String, // Base64 encoded encapsulated key
+    #[serde(rename = "wrappedMasterKey")]
+    pub wrapped_master_key: String, // Base64 encoded master key encrypted with the KEM shared key
 }
 
-// ─── Error type ──────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum KeyWorkerError {
-    /// No entry in the key file could be opened with the provided private key.
-    NoMatchingKey,
-    /// The key file JSON was malformed.
-    InvalidKeyFile(String),
-    /// An I/O error occurred reading the key source.
-    Io(std::io::Error),
-    /// A base64 decoding error.
-    Decode(String),
-    /// The ciphertext had an unexpected length.
-    InvalidCiphertext,
+pub struct KeyWorker<S: Storage> {
+    storage: S,
 }
 
-impl std::fmt::Display for KeyWorkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoMatchingKey => write!(f, "No matching key found in key file"),
-            Self::InvalidKeyFile(e) => write!(f, "Invalid key file: {e}"),
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::Decode(e) => write!(f, "Decode error: {e}"),
-            Self::InvalidCiphertext => write!(f, "Ciphertext has invalid length"),
+impl<S: Storage + Clone + Send + Sync + 'static> KeyWorker<S> {
+    pub fn new(storage: S) -> Self {
+        KeyWorker { storage }
+    }
+
+    pub async fn get_local_key(&self) -> Result<x_wing::DecapsulationKey> {
+        // Try environment variable for key file path
+        if let Some(key_path_str) = env::var_os(ENV_KEY_PATH) {
+            let key_path = PathBuf::from(key_path_str);
+            let key_b64 = tokio::fs::read_to_string(&key_path).await?;
+            let key_bytes = BASE64_STANDARD
+                .decode(key_b64.trim())
+                .map_err(|e| anyhow!("Failed to decode base64 key: {}", e))?;
+            let key_array: [u8; x_wing::DECAPSULATION_KEY_SIZE] =
+                key_bytes.as_slice().try_into().map_err(|_| {
+                    anyhow!(
+                        "Invalid X-Wing private key size from {}",
+                        key_path.display()
+                    )
+                })?;
+            return Ok(x_wing::DecapsulationKey::from(key_array));
         }
-    }
-}
 
-impl std::error::Error for KeyWorkerError {}
-
-impl From<std::io::Error> for KeyWorkerError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-// ─── KeyWorker ───────────────────────────────────────────────────────────────
-
-/// Holds the unlocked repository master key for the lifetime of the operation.
-///
-/// Created by scanning a key file against the user's X-Wing private key.
-/// Once constructed, the master key is available via [`KeyWorker::master_key`]
-/// for use with the `CryptoWorker`.
-pub struct KeyWorker {
-    master_key: Key,
-}
-
-impl KeyWorker {
-    /// Unlock from a file path.
-    ///
-    /// Opens `keys.json` (or similar), parses it, and tries every entry
-    /// against the provided decapsulation key.
-    pub fn from_file(
-        path: &std::path::Path,
-        sk: &DecapsulationKey,
-    ) -> Result<Self, KeyWorkerError> {
-        let file = std::fs::File::open(path)?;
-        Self::from_reader(file, sk)
+        Err(anyhow!("No X-Wing private key found via {}", ENV_KEY_PATH))
     }
 
-    /// Unlock from any `Read` source (file, stream, stdin, network, etc.).
-    pub fn from_reader<R: Read>(reader: R, sk: &DecapsulationKey) -> Result<Self, KeyWorkerError> {
-        let key_file: KeyFile =
-            serde_json::from_reader(reader).map_err(|e| KeyWorkerError::InvalidKeyFile(e.to_string()))?;
+    // This function generates a new symmetric master key and wraps it for the initial user.
+    pub async fn generate_new_master_key(&self) -> Result<(Vec<u8>, String)> {
+        let local_decaps_key = self.get_local_key().await?;
+        let local_pub_key = local_decaps_key.encapsulation_key().clone();
 
-        Self::try_unlock(&key_file, sk)
+        // 1. Generate a random 32-byte master key
+        let mut master_key = vec![0u8; 32];
+        OsRng.fill_bytes(&mut master_key);
+
+        // 2. Encapsulate a shared key for the initial user
+        let (ciphertext, shared_key) = local_pub_key.encapsulate();
+
+        // 3. Wrap the master key using the KEM shared key
+        let wrapped_master_key = cryptworker::encrypt_bytes(&master_key, shared_key.as_slice())?;
+
+        let initial_keys_json = KeysJson {
+            master_key_encapsulations: vec![KeyEncapsulation {
+                public_key: BASE64_STANDARD.encode(local_pub_key.to_bytes().as_slice()),
+                encapsulated_key: BASE64_STANDARD.encode(ciphertext.as_slice()),
+                wrapped_master_key: BASE64_STANDARD.encode(&wrapped_master_key),
+            }],
+        };
+
+        let keys_json_string = serde_json::to_string(&initial_keys_json)?;
+        Ok((master_key, keys_json_string))
     }
 
-    /// Returns a reference to the unlocked repo master key.
-    pub fn master_key(&self) -> &Key {
-        &self.master_key
-    }
+    pub async fn unlock_master_key(&self) -> Result<Vec<u8>> {
+        let local_decaps_key = self.get_local_key().await?;
 
-    // ── Internal ─────────────────────────────────────────────────────────
+        let raw_keys_json_content = self.storage.get("keys.json").await?;
+        let keys_json: KeysJson = serde_json::from_slice(&raw_keys_json_content)?;
 
-    /// Iterate every entry, returning the first one that decapsulates successfully.
-    fn try_unlock(key_file: &KeyFile, sk: &DecapsulationKey) -> Result<Self, KeyWorkerError> {
-        for entry in &key_file.keys {
-            match Self::try_entry(entry, sk) {
-                Ok(master_key) => return Ok(Self { master_key }),
-                Err(KeyWorkerError::NoMatchingKey) => continue, // wrong entry, try next
-                Err(e) => return Err(e),                        // hard error, bail
+        let local_pub_key_bytes = local_decaps_key.encapsulation_key().to_bytes();
+
+        for encapsulation in keys_json.master_key_encapsulations {
+            let pub_key_bytes = BASE64_STANDARD
+                .decode(&encapsulation.public_key)
+                .map_err(|e| anyhow!("Failed to decode public key base64: {}", e))?;
+
+            // Check if this encapsulation is for our local key
+            if local_pub_key_bytes.as_slice() == pub_key_bytes.as_slice() {
+                let encapsulated_key_bytes = BASE64_STANDARD
+                    .decode(&encapsulation.encapsulated_key)
+                    .map_err(|e| anyhow!("Failed to decode encapsulated key base64: {}", e))?;
+
+                let ciphertext: x_wing::Ciphertext =
+                    encapsulated_key_bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("Invalid encapsulated key size in keys.json"))?;
+
+                let shared_key = local_decaps_key.decapsulate(&ciphertext);
+
+                let wrapped_master_key = BASE64_STANDARD
+                    .decode(&encapsulation.wrapped_master_key)
+                    .map_err(|e| anyhow!("Failed to decode wrapped master key base64: {}", e))?;
+
+                // Unwrap the master key
+                let master_key =
+                    cryptworker::decrypt_bytes(&wrapped_master_key, shared_key.as_slice())
+                        .map_err(|e| anyhow!("Failed to unwrap master key: {}", e))?;
+
+                if master_key.len() != 32 {
+                    return Err(anyhow!("Unwrapped master key is not 32 bytes"));
+                }
+
+                return Ok(master_key);
             }
         }
-        Err(KeyWorkerError::NoMatchingKey)
+
+        Err(anyhow!(
+            "No master key encapsulation found for local X-Wing key in keys.json"
+        ))
     }
 
-    /// Attempt to decapsulate and AEAD-verify a single key entry.
-    fn try_entry(entry: &KeyEntry, sk: &DecapsulationKey) -> Result<Key, KeyWorkerError> {
-        // 1. Decode the X-Wing ciphertext
-        let ct_bytes = BASE64
-            .decode(&entry.ciphertext)
-            .map_err(|e| KeyWorkerError::Decode(e.to_string()))?;
+    pub async fn add_user_to_keys_json(
+        &self,
+        mut current_keys_json_value: serde_json::Value,
+        new_pubkey: &x_wing::EncapsulationKey,
+        master_key: &[u8],
+    ) -> Result<serde_json::Value> {
+        // Re-encapsulate a new shared key for the new user's public key
+        let (new_ciphertext, shared_key) = new_pubkey.encapsulate();
 
-        if ct_bytes.len() != x_wing::CIPHERTEXT_SIZE {
-            return Err(KeyWorkerError::InvalidCiphertext);
-        }
+        // Wrap the master key using the new shared key
+        let wrapped_master_key = cryptworker::encrypt_bytes(master_key, shared_key.as_slice())?;
 
-        let mut ct = x_wing::Ciphertext::default();
-        ct.copy_from_slice(&ct_bytes);
+        let new_encapsulation = KeyEncapsulation {
+            public_key: BASE64_STANDARD.encode(new_pubkey.to_bytes().as_slice()),
+            encapsulated_key: BASE64_STANDARD.encode(new_ciphertext.as_slice()),
+            wrapped_master_key: BASE64_STANDARD.encode(&wrapped_master_key),
+        };
 
-        // 2. Decapsulate → 32-byte shared secret (always succeeds; wrong key = wrong secret)
-        let shared_secret = sk.decapsulate(&ct);
+        // Add the new encapsulation to the `masterKey` array in the JSON
+        if let Some(master_key_array) = current_keys_json_value
+            .get_mut("masterKey")
+            .and_then(|v| v.as_array_mut())
+        {
+            // Check for duplicates
+            let new_pubkey_b64 = BASE64_STANDARD.encode(new_pubkey.to_bytes().as_slice());
+            for item in master_key_array.iter() {
+                if let Some(pk) = item.get("publicKey").and_then(|s| s.as_str()) {
+                    if pk == new_pubkey_b64 {
+                        return Err(anyhow!("User already exists in repository"));
+                    }
+                }
+            }
 
-        // 3. Decode the encrypted master key blob: nonce (24 bytes) + AEAD ciphertext
-        let blob = BASE64
-            .decode(&entry.encrypted_master_key)
-            .map_err(|e| KeyWorkerError::Decode(e.to_string()))?;
-
-        if blob.len() < 24 {
-            return Err(KeyWorkerError::Decode(
-                "encrypted_master_key too short for nonce".into(),
+            master_key_array.push(serde_json::to_value(new_encapsulation)?);
+        } else {
+            return Err(anyhow!(
+                "Invalid keys.json format: missing 'masterKey' array"
             ));
         }
 
-        let (nonce_bytes, aead_ct) = blob.split_at(24);
-
-        // 4. AEAD decrypt — authentication failure means wrong shared secret
-        let aead_key = Key::from_slice(shared_secret.as_ref());
-        let cipher = XChaCha20Poly1305::new(aead_key);
-        let nonce = chacha20poly1305::XNonce::from_slice(nonce_bytes);
-
-        let plaintext = cipher
-            .decrypt(nonce, aead_ct)
-            .map_err(|_| KeyWorkerError::NoMatchingKey)?;
-
-        if plaintext.len() != 32 {
-            return Err(KeyWorkerError::Decode(
-                "Decrypted master key has wrong length".into(),
-            ));
-        }
-
-        Ok(*Key::from_slice(&plaintext))
-    }
-}
-
-// ─── Key sealing helper ──────────────────────────────────────────────────────
-
-/// Create a new `KeyEntry` that encapsulates `master_key` for the holder
-/// of the given X-Wing public (encapsulation) key.
-///
-/// Use this when granting a new user access to the repository:
-/// ```ignore
-/// let entry = seal_master_key_for(&user_pk, &repo_master_key);
-/// key_file.keys.push(entry);
-/// ```
-pub fn seal_master_key_for(pk: &EncapsulationKey, master_key: &Key) -> KeyEntry {
-    // 1. Encapsulate → (ciphertext, shared_secret)
-    let (ct, shared_secret) = pk.encapsulate();
-
-    // 2. AEAD-encrypt the master key under the shared secret
-    let aead_key = Key::from_slice(shared_secret.as_ref());
-    let cipher = XChaCha20Poly1305::new(aead_key);
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let encrypted = cipher.encrypt(&nonce, master_key.as_slice()).expect("encryption failed");
-
-    // 3. Concatenate nonce + AEAD ciphertext and base64-encode
-    let mut blob = Vec::with_capacity(24 + encrypted.len());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&encrypted);
-
-    KeyEntry {
-        ciphertext: BASE64.encode(&ct),
-        encrypted_master_key: BASE64.encode(&blob),
+        Ok(current_keys_json_value)
     }
 }

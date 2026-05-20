@@ -68,7 +68,7 @@ pub fn pipe_crypto<R: Read, W: Write>(
             let mut decryptor = DecryptorBE32::from_aead(aead, nonce_bytes.as_ref().into());
 
             // Ciphertext chunks are larger due to the MAC tag
-            let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + TAG_SIZE]);
+            let mut buffer = vec![0u8; CHUNK_SIZE + TAG_SIZE];
 
             loop {
                 // Safely fill the buffer handling short reads

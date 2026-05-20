@@ -1,15 +1,16 @@
+use crate::storage::Storage;
 use anyhow::{anyhow, Result};
 use base64::prelude::*;
-use kem::{Decapsulate, Decapsulator, Encapsulate, KeyExport};
-use rand::{rngs::OsRng, RngCore};
+use hpke::{aead::ChaCha20Poly1305, kdf::HkdfSha384, kem::XWing, Deserializable, Serializable};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::path::PathBuf;
-
-use crate::storage::Storage;
-use crate::workers::cryptworker;
 
 const ENV_KEY_PATH: &str = "PQCRYPT_KEY_PATH";
+
+type Kem = XWing;
+type Aead = ChaCha20Poly1305;
+type Kdf = HkdfSha384;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeysJson {
@@ -20,159 +21,160 @@ pub struct KeysJson {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyEncapsulation {
     #[serde(rename = "publicKey")]
-    pub public_key: String, // Base64 encoded X-Wing public key
+    pub public_key: String,
     #[serde(rename = "encapsulatedKey")]
-    pub encapsulated_key: String, // Base64 encoded encapsulated key
+    pub encapsulated_key: String,
+    #[serde(rename = "authTag")]
+    pub auth_tag: String,
     #[serde(rename = "wrappedMasterKey")]
-    pub wrapped_master_key: String, // Base64 encoded master key encrypted with the KEM shared key
+    pub wrapped_master_key: String,
 }
 
 pub struct KeyWorker<S: Storage> {
     storage: S,
+    repo_url: String,
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static> KeyWorker<S> {
-    pub fn new(storage: S) -> Self {
-        KeyWorker { storage }
+    pub fn new(storage: S, repo_url: String) -> Self {
+        KeyWorker { storage, repo_url }
     }
 
-    pub async fn get_local_key(&self) -> Result<x_wing::DecapsulationKey> {
-        // Try environment variable for key file path
-        if let Some(key_path_str) = env::var_os(ENV_KEY_PATH) {
-            let key_path = PathBuf::from(key_path_str);
-            let key_b64 = tokio::fs::read_to_string(&key_path).await?;
-            let key_bytes = BASE64_STANDARD
-                .decode(key_b64.trim())
-                .map_err(|e| anyhow!("Failed to decode base64 key: {}", e))?;
-            let key_array: [u8; x_wing::DECAPSULATION_KEY_SIZE] =
-                key_bytes.as_slice().try_into().map_err(|_| {
-                    anyhow!(
-                        "Invalid X-Wing private key size from {}",
-                        key_path.display()
-                    )
-                })?;
-            return Ok(x_wing::DecapsulationKey::from(key_array));
-        }
-
-        Err(anyhow!("No X-Wing private key found via {}", ENV_KEY_PATH))
+    pub fn get_aad(&self) -> &[u8] {
+        &[]
     }
 
-    // This function generates a new symmetric master key and wraps it for the initial user.
+    pub async fn get_local_key(&self) -> Result<<Kem as hpke::kem::Kem>::PrivateKey> {
+        let key_path_str =
+            env::var(ENV_KEY_PATH).map_err(|_| anyhow!("No key path found in {}", ENV_KEY_PATH))?;
+        let key_b64 = tokio::fs::read_to_string(key_path_str).await?;
+        let key_bytes = BASE64_STANDARD.decode(key_b64.trim())?;
+        <Kem as hpke::kem::Kem>::PrivateKey::from_bytes(&key_bytes)
+            .map_err(|_| anyhow!("Invalid private key format"))
+    }
+
     pub async fn generate_new_master_key(&self) -> Result<(Vec<u8>, String)> {
-        let local_decaps_key = self.get_local_key().await?;
-        let local_pub_key = local_decaps_key.encapsulation_key().clone();
+        let local_sk = self.get_local_key().await?;
+        let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
 
-        // 1. Generate a random 32-byte master key
         let mut master_key = vec![0u8; 32];
-        OsRng.fill_bytes(&mut master_key);
+        rand::rngs::OsRng.fill_bytes(&mut master_key);
 
-        // 2. Encapsulate a shared key for the initial user
-        let (ciphertext, shared_key) = local_pub_key.encapsulate();
+        let (encapsulated_key, mut sender_ctx) = hpke::setup_sender::<Aead, Kdf, Kem>(
+            &hpke::OpModeS::Base,
+            &local_pk,
+            self.repo_url.as_bytes(),
+        )
+        .map_err(|e| anyhow!("HPKE setup failed: {}", e))?;
 
-        // 3. Wrap the master key using the KEM shared key
-        let wrapped_master_key = cryptworker::encrypt_bytes(&master_key, shared_key.as_slice())?;
+        let mut ciphertext = master_key.clone();
+        let auth_tag = sender_ctx
+            .seal_inout_detached(
+                hpke::inout::InOutBuf::from(&mut ciphertext[..]),
+                self.get_aad(),
+            )
+            .map_err(|e| anyhow!("HPKE seal failed: {}", e))?;
 
-        let initial_keys_json = KeysJson {
+        let keys_json = KeysJson {
             master_key_encapsulations: vec![KeyEncapsulation {
-                public_key: BASE64_STANDARD.encode(local_pub_key.to_bytes().as_slice()),
-                encapsulated_key: BASE64_STANDARD.encode(ciphertext.as_slice()),
-                wrapped_master_key: BASE64_STANDARD.encode(&wrapped_master_key),
+                public_key: BASE64_STANDARD.encode(local_pk.to_bytes()),
+                encapsulated_key: BASE64_STANDARD.encode(encapsulated_key.to_bytes()),
+                auth_tag: BASE64_STANDARD.encode(auth_tag.to_bytes()),
+                wrapped_master_key: BASE64_STANDARD.encode(ciphertext),
             }],
         };
 
-        let keys_json_string = serde_json::to_string(&initial_keys_json)?;
-        Ok((master_key, keys_json_string))
+        Ok((master_key, serde_json::to_string(&keys_json)?))
     }
 
     pub async fn unlock_master_key(&self) -> Result<Vec<u8>> {
-        let local_decaps_key = self.get_local_key().await?;
+        let local_sk = self.get_local_key().await?;
+        let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
+        let local_pk_bytes = local_pk.to_bytes();
 
-        let raw_keys_json_content = self.storage.get("keys.json").await?;
-        let keys_json: KeysJson = serde_json::from_slice(&raw_keys_json_content)?;
+        let raw_json = self.storage.get("keys.json").await?;
+        let keys: KeysJson = serde_json::from_slice(&raw_json)?;
 
-        let local_pub_key_bytes = local_decaps_key.encapsulation_key().to_bytes();
+        for enc in keys.master_key_encapsulations {
+            let pk_bytes = BASE64_STANDARD.decode(&enc.public_key)?;
+            if pk_bytes == local_pk_bytes.as_slice() {
+                let enc_key = <Kem as hpke::kem::Kem>::EncappedKey::from_bytes(
+                    &BASE64_STANDARD.decode(&enc.encapsulated_key)?,
+                )
+                .map_err(|_| anyhow!("Invalid enc key"))?;
 
-        for encapsulation in keys_json.master_key_encapsulations {
-            let pub_key_bytes = BASE64_STANDARD
-                .decode(&encapsulation.public_key)
-                .map_err(|e| anyhow!("Failed to decode public key base64: {}", e))?;
+                let mut ciphertext = BASE64_STANDARD.decode(&enc.wrapped_master_key)?;
+                let auth_tag_bytes = BASE64_STANDARD.decode(&enc.auth_tag)?;
 
-            // Check if this encapsulation is for our local key
-            if local_pub_key_bytes.as_slice() == pub_key_bytes.as_slice() {
-                let encapsulated_key_bytes = BASE64_STANDARD
-                    .decode(&encapsulation.encapsulated_key)
-                    .map_err(|e| anyhow!("Failed to decode encapsulated key base64: {}", e))?;
+                // Fix: Use concrete AeadTag type instead of trait associated type
+                let auth_tag = hpke::aead::AeadTag::<Aead>::from_bytes(&auth_tag_bytes)
+                    .map_err(|_| anyhow!("Invalid authentication tag"))?;
 
-                let ciphertext: x_wing::Ciphertext =
-                    encapsulated_key_bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow!("Invalid encapsulated key size in keys.json"))?;
+                let mut receiver_ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(
+                    &hpke::OpModeR::Base,
+                    &local_sk,
+                    &enc_key,
+                    self.repo_url.as_bytes(),
+                )
+                .map_err(|e| anyhow!("HPKE receiver setup failed: {}", e))?;
 
-                let shared_key = local_decaps_key.decapsulate(&ciphertext);
+                receiver_ctx
+                    .open_inout_detached(
+                        hpke::inout::InOutBuf::from(&mut ciphertext[..]),
+                        self.get_aad(),
+                        &auth_tag,
+                    )
+                    .map_err(|e| anyhow!("HPKE open failed: {}", e))?;
 
-                let wrapped_master_key = BASE64_STANDARD
-                    .decode(&encapsulation.wrapped_master_key)
-                    .map_err(|e| anyhow!("Failed to decode wrapped master key base64: {}", e))?;
-
-                // Unwrap the master key
-                let master_key =
-                    cryptworker::decrypt_bytes(&wrapped_master_key, shared_key.as_slice())
-                        .map_err(|e| anyhow!("Failed to unwrap master key: {}", e))?;
-
-                if master_key.len() != 32 {
-                    return Err(anyhow!("Unwrapped master key is not 32 bytes"));
+                if ciphertext.len() != 32 {
+                    return Err(anyhow!("Invalid key length"));
                 }
-
-                return Ok(master_key);
+                return Ok(ciphertext);
             }
         }
-
-        Err(anyhow!(
-            "No master key encapsulation found for local X-Wing key in keys.json"
-        ))
+        Err(anyhow!("User not authorized"))
     }
 
     pub async fn add_user_to_keys_json(
         &self,
-        mut current_keys_json_value: serde_json::Value,
-        new_pubkey: &x_wing::EncapsulationKey,
+        mut current_keys: serde_json::Value,
+        new_pubkey: &<Kem as hpke::kem::Kem>::PublicKey,
         master_key: &[u8],
     ) -> Result<serde_json::Value> {
-        // Re-encapsulate a new shared key for the new user's public key
-        let (new_ciphertext, shared_key) = new_pubkey.encapsulate();
+        let (encapsulated_key, mut sender_ctx) = hpke::setup_sender::<Aead, Kdf, Kem>(
+            &hpke::OpModeS::Base,
+            new_pubkey,
+            self.repo_url.as_bytes(),
+        )
+        .map_err(|e| anyhow!("HPKE setup failed: {}", e))?;
 
-        // Wrap the master key using the new shared key
-        let wrapped_master_key = cryptworker::encrypt_bytes(master_key, shared_key.as_slice())?;
+        let mut ciphertext = master_key.to_vec();
+        let auth_tag = sender_ctx
+            .seal_inout_detached(
+                hpke::inout::InOutBuf::from(&mut ciphertext[..]),
+                self.get_aad(),
+            )
+            .map_err(|e| anyhow!("HPKE seal failed: {}", e))?;
 
-        let new_encapsulation = KeyEncapsulation {
-            public_key: BASE64_STANDARD.encode(new_pubkey.to_bytes().as_slice()),
-            encapsulated_key: BASE64_STANDARD.encode(new_ciphertext.as_slice()),
-            wrapped_master_key: BASE64_STANDARD.encode(&wrapped_master_key),
+        let new_enc = KeyEncapsulation {
+            public_key: BASE64_STANDARD.encode(new_pubkey.to_bytes()),
+            encapsulated_key: BASE64_STANDARD.encode(encapsulated_key.to_bytes()),
+            auth_tag: BASE64_STANDARD.encode(auth_tag.to_bytes()),
+            wrapped_master_key: BASE64_STANDARD.encode(ciphertext),
         };
 
-        // Add the new encapsulation to the `masterKey` array in the JSON
-        if let Some(master_key_array) = current_keys_json_value
-            .get_mut("masterKey")
-            .and_then(|v| v.as_array_mut())
-        {
-            // Check for duplicates
-            let new_pubkey_b64 = BASE64_STANDARD.encode(new_pubkey.to_bytes().as_slice());
-            for item in master_key_array.iter() {
-                if let Some(pk) = item.get("publicKey").and_then(|s| s.as_str()) {
-                    if pk == new_pubkey_b64 {
-                        return Err(anyhow!("User already exists in repository"));
-                    }
-                }
-            }
+        let master_key_array = current_keys["masterKey"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("Invalid JSON"))?;
 
-            master_key_array.push(serde_json::to_value(new_encapsulation)?);
-        } else {
-            return Err(anyhow!(
-                "Invalid keys.json format: missing 'masterKey' array"
-            ));
+        if master_key_array
+            .iter()
+            .any(|v| v["publicKey"] == new_enc.public_key)
+        {
+            return Err(anyhow!("Public key already exists"));
         }
 
-        Ok(current_keys_json_value)
+        master_key_array.push(serde_json::to_value(new_enc)?);
+        Ok(current_keys)
     }
 }

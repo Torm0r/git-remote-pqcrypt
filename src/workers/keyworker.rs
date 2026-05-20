@@ -5,6 +5,7 @@ use hpke::{aead::ChaCha20Poly1305, kdf::HkdfSha384, kem::XWing, Deserializable, 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
+use zeroize::Zeroizing;
 
 const ENV_KEY_PATH: &str = "PQCRYPT_KEY_PATH";
 
@@ -53,11 +54,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> KeyWorker<S> {
             .map_err(|_| anyhow!("Invalid private key format"))
     }
 
-    pub async fn generate_new_master_key(&self) -> Result<(Vec<u8>, String)> {
+    pub async fn generate_new_master_key(&self) -> Result<(Zeroizing<Vec<u8>>, String)> {
         let local_sk = self.get_local_key().await?;
         let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
 
-        let mut master_key = vec![0u8; 32];
+        let mut master_key = Zeroizing::new(vec![0u8; 32]);
         rand::rngs::OsRng.fill_bytes(&mut master_key);
 
         let (encapsulated_key, mut sender_ctx) = hpke::setup_sender::<Aead, Kdf, Kem>(
@@ -87,7 +88,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> KeyWorker<S> {
         Ok((master_key, serde_json::to_string(&keys_json)?))
     }
 
-    pub async fn unlock_master_key(&self) -> Result<Vec<u8>> {
+    pub async fn unlock_master_key(&self) -> Result<Zeroizing<Vec<u8>>> {
         let local_sk = self.get_local_key().await?;
         let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
         let local_pk_bytes = local_pk.to_bytes();
@@ -103,7 +104,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> KeyWorker<S> {
                 )
                 .map_err(|_| anyhow!("Invalid enc key"))?;
 
-                let mut ciphertext = BASE64_STANDARD.decode(&enc.wrapped_master_key)?;
+                let mut ciphertext =
+                    Zeroizing::new(BASE64_STANDARD.decode(&enc.wrapped_master_key)?);
                 let auth_tag_bytes = BASE64_STANDARD.decode(&enc.auth_tag)?;
 
                 // Fix: Use concrete AeadTag type instead of trait associated type

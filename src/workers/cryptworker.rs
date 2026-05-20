@@ -125,11 +125,11 @@ pub fn encrypt_bytes(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decrypt bytes in-memory.
-pub fn decrypt_bytes(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
+pub fn decrypt_bytes(ciphertext: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let mut output = Zeroizing::new(Vec::new());
     pipe_crypto(
         io::Cursor::new(ciphertext),
-        &mut output,
+        &mut *output,
         key,
         CryptoMode::Decrypt,
     )?;

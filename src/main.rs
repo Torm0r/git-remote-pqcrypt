@@ -10,17 +10,13 @@ mod workers;
 async fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Git remote helper mode detection:
-    // Git invokes us as: `git-remote-pqcrypt <remote-name> <url>`
-    // where <remote-name> is something like "origin", never a known CLI subcommand.
-    // CLI mode uses: `git-remote-pqcrypt <subcommand> [args...]`
-    // Known CLI subcommands: init, add-user, keygen, help
+    // Git remote helper mode detection
     let is_git_remote_helper = args.len() == 3
         && args[2].starts_with("pqcrypt://")
         && !matches!(args[1].as_str(), "init" | "add-user" | "keygen" | "help");
 
     if is_git_remote_helper {
-        let remote_url = &args[2];
+        let remote_url = args[2].clone();
         let repo_path = remote_url.trim_start_matches("pqcrypt://");
 
         let storage = match storage::sftp::SftpStorage::new(repo_path).await {
@@ -31,7 +27,9 @@ async fn main() {
             }
         };
 
-        let key_worker = workers::keyworker::KeyWorker::new(storage.clone());
+        // Pass the full URL to KeyWorker for the HPKE info_str
+        let key_worker = workers::keyworker::KeyWorker::new(storage.clone(), remote_url);
+
         let master_key = match key_worker.unlock_master_key().await {
             Ok(key) => key,
             Err(e) => {

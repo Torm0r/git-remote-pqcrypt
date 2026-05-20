@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use zeroize::Zeroizing;
 
 use crate::storage::Storage;
 use crate::types::githash::GitHash;
@@ -13,12 +14,12 @@ use crate::workers::cryptworker;
 
 pub struct GitWorker<S: Storage> {
     storage: S,
-    master_key: Vec<u8>,
+    master_key: Zeroizing<Vec<u8>>,
     manifest: Manifest,
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
-    pub fn new(storage: S, master_key: Vec<u8>) -> Self {
+    pub fn new(storage: S, master_key: Zeroizing<Vec<u8>>) -> Self {
         GitWorker {
             storage,
             master_key,

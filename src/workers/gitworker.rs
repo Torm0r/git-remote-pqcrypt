@@ -6,12 +6,13 @@ use std::process::{Command, Stdio};
 use std::str::FromStr;
 use zeroize::Zeroizing;
 
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 use crate::types::githash::GitHash;
 use crate::types::gitref::GitRef;
 use crate::types::manifest::Manifest;
 use crate::types::packfilerecord::PackfileRecord;
 use crate::workers::cryptworker;
+use uuid::Uuid;
 
 pub struct GitWorker<S: Storage> {
     storage: S,
@@ -125,12 +126,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
                 let decrypted = cryptworker::decrypt_bytes(&encrypted_manifest, &self.master_key)?;
                 self.manifest = serde_json::from_slice(&decrypted)?;
             }
-            Err(e) => {
-                eprintln!(
-                    "warning: Could not load manifest.enc: {}. Assuming empty repository.",
-                    e
-                );
+            Err(StorageError::NotFound(_)) => {
+                eprintln!("info: No existing manifest.enc — assuming empty repository.");
                 self.manifest = Manifest::new();
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to load manifest: {}", e));
             }
         }
         Ok(())
@@ -206,7 +207,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
 
         // Encrypt and upload
         let encrypted_pack = cryptworker::encrypt_bytes(&pack_data, &self.master_key)?;
-        let pack_id = uuid::Uuid::new_v4().to_string();
+        let pack_id = Uuid::new_v4().to_string();
         let remote_pack_path = format!("objects/pack-{}.pack.enc", pack_id);
         self.storage.put(&remote_pack_path, &encrypted_pack).await?;
 
@@ -324,6 +325,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
     }
 
     fn run_pack_objects(&self, commit_range: &str) -> Result<Vec<u8>> {
+        // --thin creates deltas against objects the remote is known to have
+        // (those excluded via ^ prefix). Safe because we provide the exact
+        // commit range, and the remote resolves thin deltas with --fix-thin.
         let mut child = Command::new("git")
             .args([
                 "pack-objects",
@@ -350,6 +354,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
     }
 
     fn run_index_pack(&self, pack_data: &[u8]) -> Result<()> {
+        // --fix-thin resolves thin-pack deltas against objects already in
+        // the local repo. This is the counterpart to --thin used during push.
         let mut child = Command::new("git")
             .args(["index-pack", "--stdin", "--fix-thin"])
             .stdin(Stdio::piped())

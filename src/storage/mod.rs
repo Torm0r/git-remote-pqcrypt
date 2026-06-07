@@ -1,27 +1,36 @@
-use anyhow::Result;
 use async_trait::async_trait;
+use thiserror::Error;
 
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("File not found: {0}")]
+    NotFound(String),
+    #[error("Network/IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+pub mod dispatch;
+pub mod git_ssh;
+pub mod local;
 pub mod sftp;
 
 #[async_trait]
 pub trait Storage: Send + Sync + Clone + 'static {
-    /// Retrieves the content of a file.
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
 
-    /// Puts content into a file, overwriting if it exists.
     async fn put(&self, path: &str, content: &[u8]) -> Result<()>;
 
-    /// Lists files or directories at a given path.
     async fn list(&self, path: &str) -> Result<Vec<String>>;
 
-    /// Acquires a distributed lock for the repository.
     async fn lock(&self) -> Result<LockGuard<Self>>;
 
-    /// Releases a distributed lock for the repository.
     async fn unlock(&self) -> Result<()>;
 }
 
-/// RAII guard that automatically releases the storage lock on drop.
 pub struct LockGuard<S: Storage> {
     pub(crate) storage: S,
     pub(crate) locked: bool,

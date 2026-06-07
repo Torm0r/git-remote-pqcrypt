@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -114,7 +115,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
         io::stdout().flush()?;
         Ok(())
     }
-
+    /// Checked and secure, all data needed is wrapped by Zerozie
+    /// Manifest metadata isnt.
+    /// storage.get needs to offer different erros for if it is failure
+    /// because of network or failure because missing file
     async fn load_manifest(&mut self) -> Result<()> {
         match self.storage.get("manifest.enc").await {
             Ok(encrypted_manifest) => {
@@ -133,8 +137,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
     }
 
     async fn save_manifest(&self) -> Result<()> {
-        let manifest_json = serde_json::to_string(&self.manifest)?;
-        let encrypted = cryptworker::encrypt_bytes(manifest_json.as_bytes(), &self.master_key)?;
+        let mut manifest_bytes = Zeroizing::new(Vec::new());
+        serde_json::to_writer(&mut *manifest_bytes, &self.manifest)?;
+        let encrypted = cryptworker::encrypt_bytes(&manifest_bytes, &self.master_key)?;
         self.storage.put("manifest.enc", &encrypted).await?;
         Ok(())
     }
@@ -223,22 +228,26 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
 
     /// Fetch objects for a given sha + ref, e.g. "abc123 refs/heads/main"
     async fn do_fetch(&mut self, _arg: &str) -> Result<()> {
-        // We must process packfiles in chronological order to resolve thin-pack deltas.
+        // Collect all unique commit hashes across all packfiles
+        let all_commits: Vec<&GitHash> = self
+            .manifest
+            .packfiles
+            .iter()
+            .flat_map(|packfile| &packfile.contains_commits)
+            .collect();
+
+        // Batch-check which commits we already have locally
+        let present = self.batch_check_objects(&all_commits)?;
+
+        // Process packfiles in chronological order to resolve thin-pack deltas
         for pack_record in &self.manifest.packfiles {
-            // Check if we already have the objects this pack provides
-            let mut all_present = true;
-            for commit in &pack_record.contains_commits {
-                let status = Command::new("git")
-                    .args(["cat-file", "-e", commit.as_str()])
-                    .status()?;
-                if !status.success() {
-                    all_present = false;
-                    break;
-                }
-            }
+            let all_present = pack_record
+                .contains_commits
+                .iter()
+                .all(|git_hash| present.contains(git_hash.as_str()));
 
             if all_present {
-                continue; // We already have this pack's commits
+                continue;
             }
 
             let encrypted_pack = self.storage.get(&pack_record.path).await?;
@@ -247,6 +256,49 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
         }
 
         Ok(())
+    }
+
+    /// Feed all object hashes to a single `git cat-file --batch-check` subprocess.
+    /// Returns the set of hashes that exist locally.
+    fn batch_check_objects(&self, hashes: &[&GitHash]) -> Result<HashSet<String>> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch-check"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        // Write all hashes to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            for hash in hashes {
+                writeln!(stdin, "{}", hash.as_str())?;
+            }
+            // stdin is dropped here, closing the pipe
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(anyhow!("git cat-file --batch-check failed"));
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut present = std::collections::HashSet::new();
+
+        for line in stdout.lines() {
+            // Format: "<hash> <type> <size>" for existing objects
+            // Format: "<hash> missing" for missing objects
+            if !line.ends_with("missing") {
+                if let Some(hash) = line.split_whitespace().next() {
+                    present.insert(hash.to_string());
+                }
+            }
+        }
+
+        Ok(present)
     }
 
     // --- Git subprocess helpers ---

@@ -11,9 +11,11 @@ pub enum CryptoMode {
 }
 
 const CHUNK_SIZE: usize = 64 * 1024;
-// XChaCha20 streaming uses a 19-byte nonce (24 bytes total - 5 bytes for the stream counter)
+// XChaCha20Poly1305 nonce is 24 bytes total. The EncryptorBE32 stream wrapper
+// reserves the last 4 bytes for the BE32 block counter and 1 padding byte,
+// leaving 19 bytes for the per-stream nonce prefix.
 const STREAM_NONCE_SIZE: usize = 19;
-// Poly1305 auth tag added to every chunk
+// Poly1305 auth tag appended to every chunk
 const TAG_SIZE: usize = 16;
 
 pub fn pipe_crypto<R: Read, W: Write>(

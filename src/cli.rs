@@ -1,4 +1,3 @@
-// I would consider this checked
 use crate::storage::dispatch::{determine_type, StorageType};
 use crate::storage::git_ssh::GitStorage;
 use crate::storage::local::LocalStorage;
@@ -26,30 +25,37 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Initialize a new pqcrypt repository at the specified URL
     Init {
+        /// The storage URL (e.g., pqcrypt://local/path, sftp://..., git://...)
         url: String,
     },
+
+    /// Grant a user access by adding their public key to the repository
     AddUser {
-        /// The public key to add
+        /// The Base64-encoded public key of the user to add
         pubkey: String,
-        // This should get the local repo you are in right now by default
-        /// Optional: The repository URL (defaults to local git remote starting with pqcrypt://)
+
+        /// Optional: The repository URL (defaults to the local git remote starting with pqcrypt://)
         #[arg(short, long)]
         url: Option<String>,
     },
+
+    /// Generate a new post-quantum keypair
     Keygen {
         /// Optional: Path to save the private key (defaults to ~/.config/pqcrypt/key)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Derive and display the public key from an existing private key file
     Pubgen {
+        /// Path to the existing private key file
         private_key_path: PathBuf,
     },
 }
-
 // Generic: works for any storage backend that implements Storage + Clone
 async fn init_storage<S: Storage + Clone>(storage: S, url: String) -> Result<()> {
     let kw = KeyWorker::new(storage.clone(), url);

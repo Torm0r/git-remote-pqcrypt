@@ -20,7 +20,7 @@ pub struct GitWorker<S: Storage> {
     manifest: Manifest,
 }
 
-impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
+impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
     pub fn new(storage: S, master_key: Zeroizing<Vec<u8>>) -> Self {
         GitWorker {
             storage,
@@ -141,7 +141,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
         let mut manifest_bytes = Zeroizing::new(Vec::new());
         serde_json::to_writer(&mut *manifest_bytes, &self.manifest)?;
         let encrypted = cryptworker::encrypt_bytes(&manifest_bytes, &self.master_key)?;
-        self.storage.put("manifest.enc", &encrypted).await?;
+        self.storage.put("manifest.enc", encrypted).await?;
         Ok(())
     }
 
@@ -209,7 +209,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> GitWorker<S> {
         let encrypted_pack = cryptworker::encrypt_bytes(&pack_data, &self.master_key)?;
         let pack_id = Uuid::new_v4().to_string();
         let remote_pack_path = format!("objects/pack-{}.pack.enc", pack_id);
-        self.storage.put(&remote_pack_path, &encrypted_pack).await?;
+        self.storage.put(&remote_pack_path, encrypted_pack).await?;
 
         // Update manifest
         let new_head_hash = local_hash.clone();

@@ -374,3 +374,68 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
         Ok(())
     }
 }
+
+pub fn add_pqcrypt_remote(url: &str) -> Result<()> {
+    // Only proceed if we're inside a git repository
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output();
+
+    match git_dir {
+        Ok(output) if output.status.success() => {}
+        _ => return Ok(()), // Not a git repo — silently skip
+    }
+
+    // Check if a remote named 'pqcrypt' already exists
+    let remote_check = Command::new("git")
+        .args(["remote", "get-url", "pqcrypt"])
+        .output();
+
+    match remote_check {
+        Ok(output) if output.status.success() => {
+            let existing = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if existing == url {
+                println!("Git remote 'pqcrypt' already points to this URL.");
+                return Ok(());
+            }
+            let status = Command::new("git")
+                .args(["remote", "set-url", "pqcrypt", url])
+                .status()
+                .map_err(|_| anyhow!("Failed to update git remote 'pqcrypt'"))?;
+            if !status.success() {
+                return Err(anyhow!("Failed to update git remote 'pqcrypt'"));
+            }
+            println!("Updated git remote 'pqcrypt' -> {}", url);
+        }
+        _ => {
+            let status = Command::new("git")
+                .args(["remote", "add", "pqcrypt", url])
+                .status()
+                .map_err(|_| anyhow!("Failed to add git remote 'pqcrypt'"))?;
+            if !status.success() {
+                return Err(anyhow!("Failed to add git remote 'pqcrypt'"));
+            }
+            println!("Added git remote 'pqcrypt' -> {}", url);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn get_default_repo_url() -> Result<String> {
+    let output = Command::new("git")
+        .args(["config", "--get-regexp", r"remote\..*\.url"])
+        .output()
+        .map_err(|_| anyhow!("Failed to execute git command. Are you in a git repository?"))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 2 && parts[1].starts_with("pqcrypt://") {
+                return Ok(parts[1].to_string());
+            }
+        }
+    }
+    Err(anyhow!("Could not find a default pqcrypt:// remote in this git repository. Please specify one explicitly using --url"))
+}

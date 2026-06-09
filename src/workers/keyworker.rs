@@ -1,19 +1,21 @@
 use crate::storage::Storage;
 use anyhow::{anyhow, Result};
 use base64::prelude::*;
-use hpke::{aead::ChaCha20Poly1305, kdf::HkdfSha384, kem::XWing, Deserializable, Serializable};
-//use hpke::kem::Kem;
+use hpke::{
+    aead::ChaCha20Poly1305, kdf::HkdfSha384, kem::XWing, Deserializable, Kem as HpkeKem,
+    Serializable,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use zeroize::Zeroizing;
 
 const ENV_KEY_PATH: &str = "PQCRYPT_KEY_PATH";
+const DEFAULT_KEY_SUBPATH: &str = ".config/pqcrypt/key";
 
 type Kem = XWing;
-
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha384;
 
@@ -33,6 +35,13 @@ pub struct KeyEncapsulation {
     pub auth_tag: String,
     #[serde(rename = "wrappedMasterKey")]
     pub wrapped_master_key: String,
+    #[serde(rename = "comment", default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+pub enum InitKeyResult {
+    Existing,
+    Generated { pubkey_b64: String, path: PathBuf },
 }
 
 pub struct KeyWorker<S: Storage> {
@@ -40,11 +49,66 @@ pub struct KeyWorker<S: Storage> {
     repo_url: String,
 }
 
-async fn load_key_from_file(path: &str) -> Result<<Kem as hpke::kem::Kem>::PrivateKey> {
+fn get_default_key_path() -> Result<PathBuf> {
+    dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory found"))
+        .map(|home| home.join(DEFAULT_KEY_SUBPATH))
+}
+
+async fn load_key_from_file(path: &Path) -> Result<<Kem as HpkeKem>::PrivateKey> {
     let key_b64 = Zeroizing::new(tokio::fs::read_to_string(path).await?);
     let key_bytes = Zeroizing::new(BASE64_STANDARD.decode(key_b64.trim())?);
-    <Kem as hpke::kem::Kem>::PrivateKey::from_bytes(&key_bytes)
-        .map_err(|_| anyhow!("Invalid private key format at {}", path))
+    <Kem as HpkeKem>::PrivateKey::from_bytes(&key_bytes)
+        .map_err(|_| anyhow!("Invalid private key format at {}", path.display()))
+}
+
+pub async fn resolve_or_generate_init_key(
+    key_path: Option<PathBuf>,
+) -> Result<(<Kem as HpkeKem>::PrivateKey, InitKeyResult)> {
+    if let Some(path) = key_path {
+        let sk = load_key_from_file(&path).await?;
+        return Ok((sk, InitKeyResult::Existing));
+    }
+
+    let default_path = get_default_key_path()?;
+    if default_path.exists() {
+        let sk = load_key_from_file(&default_path).await?;
+        return Ok((sk, InitKeyResult::Existing));
+    }
+
+    if let Some(parent) = default_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let (sk, pk) = Kem::gen_keypair();
+    tokio::fs::write(&default_path, BASE64_STANDARD.encode(sk.to_bytes())).await?;
+
+    let pubkey_b64 = BASE64_STANDARD.encode(pk.to_bytes());
+    Ok((
+        sk,
+        InitKeyResult::Generated {
+            pubkey_b64,
+            path: default_path,
+        },
+    ))
+}
+
+pub fn generate_and_save_keypair(output_path: &Path) -> Result<String> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (sk, pk) = Kem::gen_keypair();
+    std::fs::write(output_path, BASE64_STANDARD.encode(sk.to_bytes()))?;
+    Ok(BASE64_STANDARD.encode(pk.to_bytes()))
+}
+
+pub async fn get_pubkey_from_file(path: &Path) -> Result<String> {
+    let b64 = Zeroizing::new(tokio::fs::read_to_string(path).await?);
+    let key_bytes = Zeroizing::new(BASE64_STANDARD.decode(b64.trim())?);
+    let sk = <Kem as HpkeKem>::PrivateKey::from_bytes(&key_bytes)
+        .map_err(|_| anyhow!("Invalid private key format at {}", path.display()))?;
+    let pk = Kem::sk_to_pk(&sk);
+    Ok(BASE64_STANDARD.encode(pk.to_bytes()))
 }
 
 impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
@@ -52,37 +116,29 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         KeyWorker { storage, repo_url }
     }
 
-    pub fn get_aad(&self) -> &[u8] {
-        &[]
-    }
-
-    pub async fn get_local_key(&self) -> Result<<Kem as hpke::kem::Kem>::PrivateKey> {
-        // 1. Environment variable
-        if let Ok(path) = env::var(ENV_KEY_PATH) {
-            if !path.is_empty() {
-                return load_key_from_file(&path).await;
+    pub async fn get_local_key(&self) -> Result<<Kem as HpkeKem>::PrivateKey> {
+        if let Ok(path_str) = env::var(ENV_KEY_PATH) {
+            if !path_str.is_empty() {
+                return load_key_from_file(Path::new(&path_str)).await;
             }
         }
 
-        // 2. Git local config
         if let Ok(output) = Command::new("git")
             .args(["config", "--get", "pqcrypt.keypath"])
             .output()
         {
             if output.status.success() {
-                let path = String::from_utf8(output.stdout)?.trim().to_string();
-                if !path.is_empty() {
-                    return load_key_from_file(&path).await;
+                let path_str = String::from_utf8(output.stdout)?.trim().to_string();
+                if !path_str.is_empty() {
+                    return load_key_from_file(Path::new(&path_str)).await;
                 }
             }
         }
 
-        // 3. Workspace directory: .pqcrypt/key
         if Path::new(".pqcrypt/key").exists() {
-            return load_key_from_file(".pqcrypt/key").await;
+            return load_key_from_file(Path::new(".pqcrypt/key")).await;
         }
 
-        // 4. Global directory scan against keys.json
         let global_dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("No home directory"))?
             .join(".config/pqcrypt");
@@ -93,10 +149,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         Err(anyhow!("No suitable private key found"))
     }
 
-    async fn find_matching_key(
-        &self,
-        key_dir: &Path,
-    ) -> Result<<Kem as hpke::kem::Kem>::PrivateKey> {
+    async fn find_matching_key(&self, key_dir: &Path) -> Result<<Kem as HpkeKem>::PrivateKey> {
         let raw_json = self.storage.get("keys.json").await?;
         let public_keys: KeysJson = serde_json::from_slice(&raw_json)?;
 
@@ -106,11 +159,11 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
             if !path.is_file() {
                 continue;
             }
-            let sk = match load_key_from_file(&path.to_string_lossy()).await {
+            let sk = match load_key_from_file(&path).await {
                 Ok(sk) => sk,
                 Err(_) => continue,
             };
-            let pk = <Kem as hpke::kem::Kem>::sk_to_pk(&sk);
+            let pk = <Kem as HpkeKem>::sk_to_pk(&sk);
             let pk_bytes = pk.to_bytes();
             for enc in &public_keys.master_key_encapsulations {
                 if let Ok(enc_pk) = BASE64_STANDARD.decode(&enc.public_key) {
@@ -123,9 +176,13 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         Err(anyhow!("No matching key found in {}", key_dir.display()))
     }
 
-    pub async fn add_new_master_key(&self) -> Result<()> {
-        let local_sk = self.get_local_key().await?;
-        let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
+    pub async fn add_new_master_key(
+        &self,
+        local_sk: &<Kem as HpkeKem>::PrivateKey,
+        comment: &str,
+    ) -> Result<()> {
+        let local_pk = <Kem as HpkeKem>::sk_to_pk(local_sk);
+        let aad = comment.as_bytes();
 
         let mut master_key = Zeroizing::new(vec![0u8; 32]);
         rand::rngs::OsRng.fill_bytes(&mut master_key);
@@ -139,10 +196,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
 
         let mut ciphertext = master_key.clone();
         let auth_tag = sender_ctx
-            .seal_inout_detached(
-                hpke::inout::InOutBuf::from(&mut ciphertext[..]),
-                self.get_aad(),
-            )
+            .seal_inout_detached(hpke::inout::InOutBuf::from(&mut ciphertext[..]), aad)
             .map_err(|e| anyhow!("HPKE seal failed: {}", e))?;
 
         let keys_json = KeysJson {
@@ -151,6 +205,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
                 encapsulated_key: BASE64_STANDARD.encode(encapsulated_key.to_bytes()),
                 auth_tag: BASE64_STANDARD.encode(auth_tag.to_bytes()),
                 wrapped_master_key: BASE64_STANDARD.encode(ciphertext),
+                comment: comment.to_string(),
             }],
         };
 
@@ -162,7 +217,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
 
     pub async fn unlock_master_key(&self) -> Result<Zeroizing<Vec<u8>>> {
         let local_sk = self.get_local_key().await?;
-        let local_pk = <Kem as hpke::kem::Kem>::sk_to_pk(&local_sk);
+        let local_pk = <Kem as HpkeKem>::sk_to_pk(&local_sk);
         let local_pk_bytes = local_pk.to_bytes();
 
         let raw_json = self.storage.get("keys.json").await?;
@@ -171,7 +226,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         for enc in keys.master_key_encapsulations {
             let pk_bytes = BASE64_STANDARD.decode(&enc.public_key)?;
             if pk_bytes == local_pk_bytes.as_slice() {
-                let enc_key = <Kem as hpke::kem::Kem>::EncappedKey::from_bytes(
+                let enc_key = <Kem as HpkeKem>::EncappedKey::from_bytes(
                     &BASE64_STANDARD.decode(&enc.encapsulated_key)?,
                 )
                 .map_err(|_| anyhow!("Invalid enc key"))?;
@@ -180,9 +235,10 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
                     Zeroizing::new(BASE64_STANDARD.decode(&enc.wrapped_master_key)?);
                 let auth_tag_bytes = BASE64_STANDARD.decode(&enc.auth_tag)?;
 
-                // Fix: Use concrete AeadTag type instead of trait associated type
                 let auth_tag = hpke::aead::AeadTag::<Aead>::from_bytes(&auth_tag_bytes)
                     .map_err(|_| anyhow!("Invalid authentication tag"))?;
+
+                let aad = enc.comment.as_bytes();
 
                 let mut receiver_ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(
                     &hpke::OpModeR::Base,
@@ -195,7 +251,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
                 receiver_ctx
                     .open_inout_detached(
                         hpke::inout::InOutBuf::from(&mut ciphertext[..]),
-                        self.get_aad(),
+                        aad,
                         &auth_tag,
                     )
                     .map_err(|e| anyhow!("HPKE open failed: {}", e))?;
@@ -209,12 +265,14 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         Err(anyhow!("User not authorized"))
     }
 
-    pub async fn add_user(&self, new_pubkey_b64: &str) -> Result<()> {
+    pub async fn add_user(&self, new_pubkey_b64: &str, comment: &str) -> Result<()> {
         let mut master_key = self.unlock_master_key().await?;
 
         let pk_bytes = BASE64_STANDARD.decode(new_pubkey_b64)?;
-        let new_pubkey = <Kem as hpke::kem::Kem>::PublicKey::from_bytes(&pk_bytes)
+        let new_pubkey = <Kem as HpkeKem>::PublicKey::from_bytes(&pk_bytes)
             .map_err(|_| anyhow!("Invalid pubkey format"))?;
+
+        let aad = comment.as_bytes();
 
         let (encapsulated_key, mut sender_ctx) = hpke::setup_sender::<Aead, Kdf, Kem>(
             &hpke::OpModeS::Base,
@@ -224,10 +282,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
         .map_err(|e| anyhow!("HPKE setup failed: {}", e))?;
 
         let auth_tag = sender_ctx
-            .seal_inout_detached(
-                hpke::inout::InOutBuf::from(&mut master_key[..]),
-                self.get_aad(),
-            )
+            .seal_inout_detached(hpke::inout::InOutBuf::from(&mut master_key[..]), aad)
             .map_err(|e| anyhow!("HPKE seal failed: {}", e))?;
 
         let new_enc = KeyEncapsulation {
@@ -235,6 +290,7 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
             encapsulated_key: BASE64_STANDARD.encode(encapsulated_key.to_bytes()),
             auth_tag: BASE64_STANDARD.encode(auth_tag.to_bytes()),
             wrapped_master_key: BASE64_STANDARD.encode(&master_key[..]),
+            comment: comment.to_string(),
         };
 
         let current_keys = self.storage.get("keys.json").await?;

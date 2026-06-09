@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use async_trait::async_trait;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -29,7 +28,6 @@ impl LocalStorage {
     }
 }
 
-#[async_trait]
 impl Storage for LocalStorage {
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
         let full_path = self.full_path(path);
@@ -42,7 +40,7 @@ impl Storage for LocalStorage {
         }
     }
 
-    async fn put(&self, path: &str, content: &[u8]) -> Result<()> {
+    async fn put(&self, path: &str, content: Vec<u8>) -> Result<()> {
         let full_path = self.full_path(path);
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -109,7 +107,10 @@ impl Storage for LocalStorage {
                             }
                         }
                     } else {
-                        return Err(StorageError::Other(anyhow!("Failed to acquire lock: {}", e)));
+                        return Err(StorageError::Other(anyhow!(
+                            "Failed to acquire lock: {}",
+                            e
+                        )));
                     }
                 }
             }
@@ -121,6 +122,26 @@ impl Storage for LocalStorage {
         let lock_info_path = lock_dir_path.join(LOCK_INFO_FILE);
         fs::remove_file(&lock_info_path).await.ok();
         fs::remove_dir(&lock_dir_path).await.ok();
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let full_path = self.full_path(path);
+        match fs::remove_file(&full_path).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
+    async fn put_atomic(&self, path: &str, content: Vec<u8>) -> Result<()> {
+        let full_path = self.full_path(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = full_path.with_extension("tmp");
+        fs::write(&tmp_path, content).await?;
+        fs::rename(&tmp_path, &full_path).await?;
         Ok(())
     }
 }

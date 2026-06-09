@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -18,17 +17,28 @@ pub mod git_ssh;
 pub mod local;
 pub mod sftp;
 
-#[async_trait]
-pub trait Storage: Send + Sync + Clone + 'static {
+pub trait Storage: Send + Sync + Clone {
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
 
-    async fn put(&self, path: &str, content: &[u8]) -> Result<()>;
+    async fn put(&self, path: &str, content: Vec<u8>) -> Result<()>;
 
     async fn list(&self, path: &str) -> Result<Vec<String>>;
 
     async fn lock(&self) -> Result<LockGuard<Self>>;
 
     async fn unlock(&self) -> Result<()>;
+
+    async fn delete(&self, path: &str) -> Result<()>;
+
+    async fn put_atomic(&self, path: &str, content: Vec<u8>) -> Result<()>;
+
+    async fn fetch_sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn push_sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct LockGuard<S: Storage> {

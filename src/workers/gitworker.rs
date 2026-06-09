@@ -30,6 +30,9 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Fetch/sync prior to loading the manifest to make sure we've mirrored the remote state
+        self.storage.fetch_sync().await?;
+
         self.load_manifest().await?;
 
         let stdin = io::stdin();
@@ -84,6 +87,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
 
     /// Process a batch of push or fetch commands, then print a terminating blank line.
     async fn process_batch(&mut self, batch: &[String]) -> Result<()> {
+        let mut processed_push = false;
         for line in batch {
             let parts: Vec<&str> = line.split_whitespace().collect();
             let cmd = parts[0];
@@ -97,6 +101,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
                     match self.do_push(refspec).await {
                         Ok(_) => {
                             println!("ok {}", dst_ref);
+                            processed_push = true;
                         }
                         Err(e) => {
                             println!("error {} {}", dst_ref, e);
@@ -111,6 +116,12 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
                 _ => {}
             }
         }
+
+        // If a push was processed, push-sync the changes to the remote repository.
+        if processed_push {
+            self.storage.push_sync().await?;
+        }
+
         // Blank line terminates the batch response
         println!();
         io::stdout().flush()?;

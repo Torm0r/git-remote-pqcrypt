@@ -76,6 +76,10 @@ async fn init_storage<S: Storage + Clone>(
 
     let kw = KeyWorker::new(storage.clone(), url);
     kw.add_new_master_key(&sk, &comment).await?;
+
+    // push changes to remote immediately for Git
+    storage.push_sync().await?;
+
     Ok(())
 }
 
@@ -87,6 +91,10 @@ async fn add_user_to_storage<S: Storage + Clone>(
 ) -> Result<()> {
     let kw = KeyWorker::new(storage.clone(), url);
     kw.add_user(&pubkey, &comment).await?;
+
+    // push changes to remote immediately for Git
+    storage.push_sync().await?;
+
     Ok(())
 }
 

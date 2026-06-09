@@ -3,34 +3,34 @@ use crate::storage::git_ssh::GitStorage;
 use crate::storage::local::LocalStorage;
 use crate::storage::sftp::SftpStorage;
 use crate::storage::Storage;
-use crate::workers::keyworker::KeyWorker;
+use crate::workers::gitworker;
+use crate::workers::keyworker::{self, InitKeyResult, KeyWorker};
 use anyhow::{anyhow, Result};
-use base64::prelude::*;
 use clap::{Parser, Subcommand};
-use hpke::aead::ChaCha20Poly1305;
-use hpke::kdf::HkdfSha384;
-use hpke::kem::{Kem, XWing};
-use hpke::{Deserializable, Serializable};
+use std::io;
 use std::io::Write;
 use std::path::PathBuf;
-use std::{fs, io};
-use zeroize::Zeroizing;
-
-type MyKem = XWing;
-type MyAead = ChaCha20Poly1305;
-type MyKdf = HkdfSha384;
 
 #[derive(Parser, Debug)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a new pqcrypt repository at the specified URL
     Init {
         /// The storage URL (e.g., pqcrypt://local/path, sftp://..., git://...)
         url: String,
+
+        /// Optional: Path to the private key to initialize the repo with
+        #[arg(short, long)]
+        key: Option<PathBuf>,
+
+        /// Optional: Identity comment for this key (e.g. 'work', 'personal')
+        #[arg(short, long)]
+        comment: Option<String>,
     },
 
     /// Grant a user access by adding their public key to the repository
@@ -41,6 +41,10 @@ enum Commands {
         /// Optional: The repository URL (defaults to the local git remote starting with pqcrypt://)
         #[arg(short, long)]
         url: Option<String>,
+
+        /// Optional: Identity comment for the new user
+        #[arg(short, long)]
+        comment: Option<String>,
     },
 
     /// Generate a new post-quantum keypair
@@ -56,10 +60,22 @@ enum Commands {
         private_key_path: PathBuf,
     },
 }
-// Generic: works for any storage backend that implements Storage + Clone
-async fn init_storage<S: Storage + Clone>(storage: S, url: String) -> Result<()> {
+
+async fn init_storage<S: Storage + Clone>(
+    storage: S,
+    url: String,
+    sk: <hpke::kem::XWing as hpke::kem::Kem>::PrivateKey,
+    comment: String,
+) -> Result<()> {
+    // Guard: refuse to overwrite an existing repository
+    if storage.get("keys.json").await.is_ok() {
+        return Err(anyhow!(
+            "Repository already initialized (keys.json already exists). Aborting to prevent overwriting the master key."
+        ));
+    }
+
     let kw = KeyWorker::new(storage.clone(), url);
-    kw.add_new_master_key().await?;
+    kw.add_new_master_key(&sk, &comment).await?;
     Ok(())
 }
 
@@ -67,32 +83,55 @@ async fn add_user_to_storage<S: Storage + Clone>(
     storage: S,
     url: String,
     pubkey: String,
+    comment: String,
 ) -> Result<()> {
     let kw = KeyWorker::new(storage.clone(), url);
-    kw.add_user(&pubkey).await?;
+    kw.add_user(&pubkey, &comment).await?;
     Ok(())
 }
 
-async fn init_repo(url: String) -> Result<()> {
-    let repo_path = url.trim_start_matches("pqcrypt://");
-    match determine_type(&url) {
-        StorageType::Local => init_storage(LocalStorage::new(repo_path).await?, url).await,
-        StorageType::Sftp => init_storage(SftpStorage::new(repo_path).await?, url).await,
-        StorageType::Git => init_storage(GitStorage::new(repo_path).await?, url).await,
+async fn init_repo(url: String, key_path: Option<PathBuf>, comment: Option<String>) -> Result<()> {
+    let (sk, key_result) = keyworker::resolve_or_generate_init_key(key_path).await?;
+    if let InitKeyResult::Generated { pubkey_b64, path } = &key_result {
+        println!(
+            "No key found. Auto-generating default key at {}...",
+            path.display()
+        );
+        println!("Public Key:\n{}", pubkey_b64);
     }
+
+    let comment = match comment {
+        Some(c) => c,
+        None => prompt_for_comment()?,
+    };
+
+    let repo_path = url.trim_start_matches("pqcrypt://");
+    let url_clone = url.clone();
+    match determine_type(&url) {
+        StorageType::Local => {
+            init_storage(LocalStorage::new(repo_path).await?, url, sk, comment).await
+        }
+        StorageType::Sftp => {
+            init_storage(SftpStorage::new(repo_path).await?, url, sk, comment).await
+        }
+        StorageType::Git => init_storage(GitStorage::new(repo_path).await?, url, sk, comment).await,
+    }?;
+
+    gitworker::add_pqcrypt_remote(&url_clone)?;
+    Ok(())
 }
 
-async fn add_user_repo(url: String, pubkey: String) -> Result<()> {
+async fn add_user_repo(url: String, pubkey: String, comment: String) -> Result<()> {
     let repo_path = url.trim_start_matches("pqcrypt://");
     match determine_type(&url) {
         StorageType::Local => {
-            add_user_to_storage(LocalStorage::new(repo_path).await?, url, pubkey).await
+            add_user_to_storage(LocalStorage::new(repo_path).await?, url, pubkey, comment).await
         }
         StorageType::Sftp => {
-            add_user_to_storage(SftpStorage::new(repo_path).await?, url, pubkey).await
+            add_user_to_storage(SftpStorage::new(repo_path).await?, url, pubkey, comment).await
         }
         StorageType::Git => {
-            add_user_to_storage(GitStorage::new(repo_path).await?, url, pubkey).await
+            add_user_to_storage(GitStorage::new(repo_path).await?, url, pubkey, comment).await
         }
     }
 }
@@ -100,68 +139,45 @@ async fn add_user_repo(url: String, pubkey: String) -> Result<()> {
 pub async fn parse_and_run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { url } => init_repo(url).await,
-        Commands::AddUser { url, pubkey } => {
-            // Resolve the URL: either the user gave us one, or we auto-detect it
+        Commands::Init { url, key, comment } => init_repo(url, key, comment).await,
+        Commands::AddUser {
+            url,
+            pubkey,
+            comment,
+        } => {
             let final_url = match url {
                 Some(u) => u,
-                None => get_default_repo_url()?,
+                None => gitworker::get_default_repo_url()?,
             };
-
-            add_user_repo(final_url, pubkey).await
+            let comment = comment.unwrap_or_default();
+            add_user_repo(final_url, pubkey, comment).await
         }
         Commands::Keygen { output } => {
-            // Only generate and save if the user didn't abort
             if let Some(resolved_path) = resolve_key_path(output)? {
-                generate_and_save_keypair(resolved_path)?;
+                let pubkey = keyworker::generate_and_save_keypair(&resolved_path)?;
+                println!("\nSaved private key to: {}", resolved_path.display());
+                println!("Public Key:\n{}", pubkey);
             }
             Ok(())
         }
         Commands::Pubgen {
             private_key_path: input,
         } => {
-            // Read base64-encoded private key (matches Keygen output format)
-            let key_bytes = Zeroizing::new(
-                BASE64_STANDARD.decode(tokio::fs::read_to_string(&input).await?.trim())?,
-            );
-
-            // Parse into the KEM's PrivateKey type
-            let sk = <MyKem as Kem>::PrivateKey::from_bytes(&key_bytes)
-                .map_err(|_| anyhow!("Invalid private key format at {}", input.display()))?;
-
-            // Derive public key from secret key
-            let pk = MyKem::sk_to_pk(&sk);
-
-            println!("Public Key: \n{}", BASE64_STANDARD.encode(pk.to_bytes()));
+            let pubkey = keyworker::get_pubkey_from_file(&input).await?;
+            println!("Public Key: \n{}", pubkey);
             Ok(())
         }
     }
 }
-fn get_default_repo_url() -> Result<String> {
-    // `git config --get-regexp remote\..*\.url` prints all remotes like:
-    // remote.origin.url pqcrypt://local/path
-    // remote.upstream.url git@github.com:...
-    let output = std::process::Command::new("git")
-        .args(["config", "--get-regexp", r"remote\..*\.url"])
-        .output()
-        .map_err(|_| anyhow!("Failed to execute git command. Are you in a git repository?"))?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // parts[0] is the config key, parts[1] is the URL
-            if parts.len() == 2 && parts[1].starts_with("pqcrypt://") {
-                return Ok(parts[1].to_string());
-            }
-        }
-    }
-
-    Err(anyhow!("Could not find a default pqcrypt:// remote in this git repository. Please specify one explicitly using --url"))
+fn prompt_for_comment() -> Result<String> {
+    print!("Add a comment/identity to this key (e.g. 'personal', 'work') [optional]: ");
+    io::stdout().flush()?;
+    let mut comment = String::new();
+    io::stdin().read_line(&mut comment)?;
+    Ok(comment.trim().to_string())
 }
 
-/// Interactively resolves the output path, prompting the user if the file already exists.
-/// Returns `Ok(Some(PathBuf))` if safe to proceed, or `Ok(None)` if the user aborted.
 fn resolve_key_path(output: Option<PathBuf>) -> Result<Option<PathBuf>> {
     let mut final_output = match output {
         Some(path) => path,
@@ -199,14 +215,12 @@ fn resolve_key_path(output: Option<PathBuf>) -> Result<Option<PathBuf>> {
                         continue;
                     }
 
-                    // Expand "~/" to the user's home directory
                     if new_path_trimmed.starts_with("~/") {
                         if let Some(home) = dirs::home_dir() {
                             final_output = home.join(&new_path_trimmed[2..]);
                             continue;
                         }
                     }
-
                     final_output = PathBuf::from(new_path_trimmed);
                 }
                 _ => {
@@ -215,29 +229,8 @@ fn resolve_key_path(output: Option<PathBuf>) -> Result<Option<PathBuf>> {
                 }
             }
         } else {
-            // Path does not exist, safe to proceed
             break;
         }
     }
-
     Ok(Some(final_output))
-}
-/// Generates the keypair and saves it safely to disk.
-fn generate_and_save_keypair(output_path: PathBuf) -> Result<()> {
-    // Safely create the parent directories if they don't exist
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Generate the keys
-    let (sk, pk): (<MyKem as Kem>::PrivateKey, <MyKem as Kem>::PublicKey) = MyKem::gen_keypair();
-
-    // Save the private key
-    fs::write(&output_path, BASE64_STANDARD.encode(sk.to_bytes()))?;
-
-    // Provide clear feedback to the user
-    println!("\nSaved private key to: {}", output_path.display());
-    println!("Public Key:\n{}", BASE64_STANDARD.encode(pk.to_bytes()));
-
-    Ok(())
 }

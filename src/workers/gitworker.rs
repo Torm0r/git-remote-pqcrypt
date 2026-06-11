@@ -30,9 +30,6 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Fetch/sync prior to loading the manifest to make sure we've mirrored the remote state
-        self.storage.fetch_sync().await?;
-
         self.load_manifest().await?;
 
         let stdin = io::stdin();
@@ -190,9 +187,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
 
         // Handle deletion: if local_ref is empty, git wants to delete remote_ref
         if local_ref.is_empty() {
-            self.manifest
-                .heads
-                .remove(&GitRef::from_str(remote_ref).unwrap());
+            self.manifest.heads.remove(&GitRef::from_str(remote_ref)?);
             self.save_manifest().await?;
             lock_guard.release().await?;
             return Ok(remote_ref.to_string());
@@ -205,7 +200,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
             .heads
             .get(&GitRef::from_str(remote_ref).unwrap());
         let local_hash = local_heads
-            .get(&GitRef::from_str(remote_ref).unwrap())
+            .get(&GitRef::from_str(local_ref)?)
             .ok_or_else(|| anyhow!("No local ref found for {}", local_ref))?;
 
         let commit_range = match current_remote_hash {
@@ -226,7 +221,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
         let new_head_hash = local_hash.clone();
         self.manifest
             .heads
-            .insert(GitRef::from_str(remote_ref).unwrap(), new_head_hash.clone());
+            .insert(GitRef::from_str(remote_ref)?, new_head_hash.clone());
         self.manifest.packfiles.push(PackfileRecord {
             id: pack_id,
             path: remote_pack_path,

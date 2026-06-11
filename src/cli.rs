@@ -5,7 +5,7 @@ use crate::storage::sftp::SftpStorage;
 use crate::storage::Storage;
 use crate::workers::gitworker;
 use crate::workers::keyworker::{self, InitKeyResult, KeyWorker};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io;
 use std::io::Write;
@@ -61,13 +61,47 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Clone)]
+struct ParsedPqcryptUrl {
+    canonical: String,
+    storage_path: String,
+}
+
+fn parse_pqcrypt_url(input: &str) -> ParsedPqcryptUrl {
+    if let Some(rest) = input.strip_prefix("pqcrypt::") {
+        ParsedPqcryptUrl {
+            canonical: format!("pqcrypt::{}", rest),
+            storage_path: rest.to_string(),
+        }
+    } else if let Some(rest) = input.strip_prefix("pqcrypt://") {
+        ParsedPqcryptUrl {
+            canonical: format!("pqcrypt::{}", rest),
+            storage_path: rest.to_string(),
+        }
+    } else if let Some(rest) = input.strip_prefix("pqcrypt:") {
+        ParsedPqcryptUrl {
+            canonical: format!("pqcrypt::{}", rest),
+            storage_path: rest.to_string(),
+        }
+    } else {
+        ParsedPqcryptUrl {
+            canonical: format!("pqcrypt::{}", input),
+            storage_path: input.to_string(),
+        }
+    }
+}
+
 async fn init_storage<S: Storage + Clone>(
     storage: S,
     url: String,
     sk: <hpke::kem::XWing as hpke::kem::Kem>::PrivateKey,
     comment: String,
 ) -> Result<()> {
-    // Guard: refuse to overwrite an existing repository
+    storage
+        .fetch_sync()
+        .await
+        .context("init: fetch_sync failed")?;
+
     if storage.get("keys.json").await.is_ok() {
         return Err(anyhow!(
             "Repository already initialized (keys.json already exists). Aborting to prevent overwriting the master key."
@@ -75,10 +109,14 @@ async fn init_storage<S: Storage + Clone>(
     }
 
     let kw = KeyWorker::new(storage.clone(), url);
-    kw.add_new_master_key(&sk, &comment).await?;
+    kw.add_new_master_key(&sk, &comment)
+        .await
+        .context("init: failed to create keys.json")?;
 
-    // push changes to remote immediately for Git
-    storage.push_sync().await?;
+    storage
+        .push_sync()
+        .await
+        .context("init: failed to push initial pqcrypt state")?;
 
     Ok(())
 }
@@ -89,16 +127,21 @@ async fn add_user_to_storage<S: Storage + Clone>(
     pubkey: String,
     comment: String,
 ) -> Result<()> {
+    storage.fetch_sync().await?;
+
     let kw = KeyWorker::new(storage.clone(), url);
     kw.add_user(&pubkey, &comment).await?;
 
-    // push changes to remote immediately for Git
     storage.push_sync().await?;
 
     Ok(())
 }
 
 async fn init_repo(url: String, key_path: Option<PathBuf>, comment: Option<String>) -> Result<()> {
+    let parsed = parse_pqcrypt_url(&url);
+    let url = parsed.canonical;
+    let repo_path = parsed.storage_path;
+
     let (sk, key_result) = keyworker::resolve_or_generate_init_key(key_path).await?;
     if let InitKeyResult::Generated { pubkey_b64, path } = &key_result {
         println!(
@@ -113,33 +156,39 @@ async fn init_repo(url: String, key_path: Option<PathBuf>, comment: Option<Strin
         None => prompt_for_comment()?,
     };
 
-    let repo_path = url.trim_start_matches("pqcrypt://");
-    let url_clone = url.clone();
-    match determine_type(&url) {
+    match determine_type(&repo_path) {
         StorageType::Local => {
-            init_storage(LocalStorage::new(repo_path).await?, url, sk, comment).await
+            let s = LocalStorage::new(&repo_path).await?;
+            init_storage(s, url.clone(), sk, comment).await?;
         }
         StorageType::Sftp => {
-            init_storage(SftpStorage::new(repo_path).await?, url, sk, comment).await
+            let s = SftpStorage::new(&repo_path).await?;
+            init_storage(s, url.clone(), sk, comment).await?;
         }
-        StorageType::Git => init_storage(GitStorage::new(repo_path).await?, url, sk, comment).await,
-    }?;
+        StorageType::Git => {
+            let s = GitStorage::new(&repo_path).await?;
+            init_storage(s, url.clone(), sk, comment).await?;
+        }
+    };
 
-    gitworker::add_pqcrypt_remote(&url_clone)?;
+    gitworker::add_pqcrypt_remote(&url)?;
     Ok(())
 }
 
 async fn add_user_repo(url: String, pubkey: String, comment: String) -> Result<()> {
-    let repo_path = url.trim_start_matches("pqcrypt://");
-    match determine_type(&url) {
+    let parsed = parse_pqcrypt_url(&url);
+    let url = parsed.canonical;
+    let repo_path = parsed.storage_path;
+
+    match determine_type(&repo_path) {
         StorageType::Local => {
-            add_user_to_storage(LocalStorage::new(repo_path).await?, url, pubkey, comment).await
+            add_user_to_storage(LocalStorage::new(&repo_path).await?, url, pubkey, comment).await
         }
         StorageType::Sftp => {
-            add_user_to_storage(SftpStorage::new(repo_path).await?, url, pubkey, comment).await
+            add_user_to_storage(SftpStorage::new(&repo_path).await?, url, pubkey, comment).await
         }
         StorageType::Git => {
-            add_user_to_storage(GitStorage::new(repo_path).await?, url, pubkey, comment).await
+            add_user_to_storage(GitStorage::new(&repo_path).await?, url, pubkey, comment).await
         }
     }
 }
@@ -154,12 +203,13 @@ pub async fn parse_and_run() -> Result<()> {
             comment,
         } => {
             let final_url = match url {
-                Some(u) => u,
+                Some(u) => parse_pqcrypt_url(&u).canonical,
                 None => gitworker::get_default_repo_url()?,
             };
             let comment = comment.unwrap_or_default();
             add_user_repo(final_url, pubkey, comment).await
         }
+
         Commands::Keygen { output } => {
             if let Some(resolved_path) = resolve_key_path(output)? {
                 let pubkey = keyworker::generate_and_save_keypair(&resolved_path)?;
@@ -168,6 +218,7 @@ pub async fn parse_and_run() -> Result<()> {
             }
             Ok(())
         }
+
         Commands::Pubgen {
             private_key_path: input,
         } => {

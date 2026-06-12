@@ -12,10 +12,10 @@ pub enum StorageError {
     Other(#[from] anyhow::Error),
 }
 
-pub mod dispatch;
-pub mod git_ssh;
-pub mod local;
-pub mod sftp;
+pub(crate) mod dispatch;
+pub(crate) mod git_ssh;
+pub(crate) mod local;
+pub(crate) mod sftp;
 
 pub trait Storage: Send + Sync + Clone {
     async fn get(&self, path: &str) -> Result<Vec<u8>>;

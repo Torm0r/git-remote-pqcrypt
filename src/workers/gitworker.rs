@@ -124,10 +124,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
         io::stdout().flush()?;
         Ok(())
     }
-    /// Checked and secure, all data needed is wrapped by Zerozie
-    /// Manifest metadata isnt.
-    /// storage.get needs to offer different erros for if it is failure
-    /// because of network or failure because missing file
+
     async fn load_manifest(&mut self) -> Result<()> {
         match self.storage.get("manifest.enc").await {
             Ok(encrypted_manifest) => {

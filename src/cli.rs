@@ -3,7 +3,7 @@ use crate::url::parse_pqcrypt_url;
 use crate::with_storage;
 use crate::workers::gitworker;
 use crate::workers::keyworker::{self, InitKeyResult, KeyWorker};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use std::io;
 use std::io::Write;
@@ -224,12 +224,13 @@ fn resolve_key_path(output: Option<PathBuf>) -> Result<Option<PathBuf>> {
                         continue;
                     }
 
-                    if new_path_trimmed.starts_with("~/") {
-                        if let Some(home) = dirs::home_dir() {
-                            final_output = home.join(&new_path_trimmed[2..]);
-                            continue;
-                        }
+                    if let Some(path_trimmed) = new_path_trimmed.strip_prefix("~/")
+                        && let Some(home) = dirs::home_dir()
+                    {
+                        final_output = home.join(path_trimmed);
+                        continue;
                     }
+
                     final_output = PathBuf::from(new_path_trimmed);
                 }
                 _ => {

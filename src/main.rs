@@ -30,10 +30,10 @@ fn invoked_as_git_remote_helper(args: &[String]) -> bool {
     // If argv[1] is a known CLI subcommand, this is a direct user invocation,
     // not a git remote helper call — fall through to the CLI parser.
     let cli_subcommands = ["init", "add-user", "keygen", "pubgen", "help"];
-    if let Some(first_arg) = args.get(1) {
-        if cli_subcommands.contains(&first_arg.as_str()) {
-            return false;
-        }
+    if let Some(first_arg) = args.get(1)
+        && cli_subcommands.contains(&first_arg.as_str())
+    {
+        return false;
     }
 
     true

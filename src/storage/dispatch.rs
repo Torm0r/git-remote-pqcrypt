@@ -28,7 +28,7 @@ pub fn determine_type(url: &str) -> StorageType {
 #[macro_export]
 macro_rules! with_storage {
     ($repo_path:expr, $storage:ident => $body:expr) => {{
-        use $crate::storage::dispatch::{determine_type, StorageType};
+        use $crate::storage::dispatch::{StorageType, determine_type};
         match determine_type($repo_path) {
             StorageType::Local => {
                 let $storage = $crate::storage::local::LocalStorage::new($repo_path).await?;

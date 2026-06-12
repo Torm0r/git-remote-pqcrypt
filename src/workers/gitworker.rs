@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
@@ -88,7 +88,7 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
         for line in batch {
             let parts: Vec<&str> = line.split_whitespace().collect();
             let cmd = parts[0];
-            let arg = parts.get(1).map(|s| *s).unwrap_or("");
+            let arg = parts.get(1).copied().unwrap_or("");
 
             match cmd {
                 "push" => {
@@ -295,10 +295,10 @@ impl<S: Storage + Clone + Send + Sync> GitWorker<S> {
         for line in stdout.lines() {
             // Format: "<hash> <type> <size>" for existing objects
             // Format: "<hash> missing" for missing objects
-            if !line.ends_with("missing") {
-                if let Some(hash) = line.split_whitespace().next() {
-                    present.insert(hash.to_string());
-                }
+            if !line.ends_with("missing")
+                && let Some(hash) = line.split_whitespace().next()
+            {
+                present.insert(hash.to_string());
             }
         }
 
@@ -440,5 +440,7 @@ pub fn get_default_repo_url() -> Result<String> {
             }
         }
     }
-    Err(anyhow!("Could not find a default pqcrypt:// remote in this git repository. Please specify one explicitly using --url"))
+    Err(anyhow!(
+        "Could not find a default pqcrypt:// remote in this git repository. Please specify one explicitly using --url"
+    ))
 }

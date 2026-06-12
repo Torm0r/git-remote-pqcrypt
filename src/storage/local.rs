@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::storage::{LockGuard, Result, Storage, StorageError};
 
@@ -102,17 +102,25 @@ impl Storage for LocalStorage {
 
                                 if current_timestamp > locked_timestamp + LOCK_TIMEOUT_MINUTES * 60
                                 {
-                                    eprintln!("warning: Detected stale lock from {} at {}. Attempting to force remove.", locked_by_user, locked_timestamp_str);
+                                    eprintln!(
+                                        "warning: Detected stale lock from {} at {}. Attempting to force remove.",
+                                        locked_by_user, locked_timestamp_str
+                                    );
                                     fs::remove_file(&lock_info_path).await.ok();
                                     fs::remove_dir(&lock_dir_path).await.ok();
                                     sleep(Duration::from_secs(1)).await;
                                     continue;
                                 } else {
-                                    return Err(StorageError::Other(anyhow!("Remote repository is locked by another process ({}). Try again later.", locked_by_user)));
+                                    return Err(StorageError::Other(anyhow!(
+                                        "Remote repository is locked by another process ({}). Try again later.",
+                                        locked_by_user
+                                    )));
                                 }
                             }
                             Err(_) => {
-                                return Err(StorageError::Other(anyhow!("Remote repository is locked by an unknown process. Lock directory exists but info file is unreadable.")));
+                                return Err(StorageError::Other(anyhow!(
+                                    "Remote repository is locked by an unknown process. Lock directory exists but info file is unreadable."
+                                )));
                             }
                         }
                     } else {

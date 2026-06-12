@@ -1,15 +1,17 @@
 use crate::storage::Storage;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use base64::prelude::*;
 use hpke::{
-    aead::ChaCha20Poly1305, kdf::HkdfSha384, kem::XWing, Deserializable, Kem as HpkeKem,
-    Serializable,
+    Deserializable, Kem as HpkeKem, Serializable, aead::ChaCha20Poly1305, kdf::HkdfSha256,
+    kem::XWing,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
 const ENV_KEY_PATH: &str = "PQCRYPT_KEY_PATH";
@@ -17,7 +19,7 @@ const DEFAULT_KEY_SUBPATH: &str = ".config/pqcrypt/key";
 
 type Kem = XWing;
 type Aead = ChaCha20Poly1305;
-type Kdf = HkdfSha384;
+type Kdf = HkdfSha256;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeysJson {
@@ -81,7 +83,16 @@ pub async fn resolve_or_generate_init_key(
     }
 
     let (sk, pk) = Kem::gen_keypair();
-    tokio::fs::write(&default_path, BASE64_STANDARD.encode(sk.to_bytes())).await?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&default_path)
+        .await?;
+
+    file.write_all(&sk.to_bytes()).await?;
 
     let pubkey_b64 = BASE64_STANDARD.encode(pk.to_bytes());
     Ok((
@@ -117,21 +128,20 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
     }
 
     pub async fn get_local_key(&self) -> Result<<Kem as HpkeKem>::PrivateKey> {
-        if let Ok(path_str) = env::var(ENV_KEY_PATH) {
-            if !path_str.is_empty() {
-                return load_key_from_file(Path::new(&path_str)).await;
-            }
+        if let Ok(path_str) = env::var(ENV_KEY_PATH)
+            && !path_str.is_empty()
+        {
+            return load_key_from_file(Path::new(&path_str)).await;
         }
 
         if let Ok(output) = Command::new("git")
             .args(["config", "--get", "pqcrypt.keypath"])
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let path_str = String::from_utf8(output.stdout)?.trim().to_string();
-                if !path_str.is_empty() {
-                    return load_key_from_file(Path::new(&path_str)).await;
-                }
+            let path_str = String::from_utf8(output.stdout)?.trim().to_string();
+            if !path_str.is_empty() {
+                return load_key_from_file(Path::new(&path_str)).await;
             }
         }
 
@@ -166,10 +176,10 @@ impl<S: Storage + Clone + Send + Sync> KeyWorker<S> {
             let pk = <Kem as HpkeKem>::sk_to_pk(&sk);
             let pk_bytes = pk.to_bytes();
             for enc in &public_keys.master_key_encapsulations {
-                if let Ok(enc_pk) = BASE64_STANDARD.decode(&enc.public_key) {
-                    if enc_pk == pk_bytes.as_slice() {
-                        return Ok(sk);
-                    }
+                if let Ok(enc_pk) = BASE64_STANDARD.decode(&enc.public_key)
+                    && enc_pk == pk_bytes.as_slice()
+                {
+                    return Ok(sk);
                 }
             }
         }

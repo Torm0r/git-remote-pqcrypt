@@ -16,7 +16,7 @@ pub(crate) mod dispatch;
 pub(crate) mod git_ssh;
 pub(crate) mod local;
 pub(crate) mod sftp;
-
+#[allow(dead_code)]
 pub trait Storage: Send + Sync + Clone {
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
 

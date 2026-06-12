@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use openssh::{KnownHosts, Session};
 use openssh_sftp_client::{Sftp, SftpOptions};
 use std::sync::Arc;

@@ -23,6 +23,11 @@ impl LocalStorage {
         Ok(LocalStorage { repo_root })
     }
 
+    /// Returns a reference to the root directory path.
+    pub fn root(&self) -> &std::path::Path {
+        &self.repo_root
+    }
+
     fn full_path(&self, relative_path: &str) -> PathBuf {
         self.repo_root.join(relative_path)
     }
@@ -51,8 +56,12 @@ impl Storage for LocalStorage {
 
     async fn list(&self, path: &str) -> Result<Vec<String>> {
         let full_path = self.full_path(path);
+        let mut read_dir = match fs::read_dir(&full_path).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
         let mut entries = Vec::new();
-        let mut read_dir = fs::read_dir(&full_path).await?;
         while let Some(entry) = read_dir.next_entry().await? {
             if let Some(name) = entry.file_name().to_str() {
                 entries.push(name.to_string());

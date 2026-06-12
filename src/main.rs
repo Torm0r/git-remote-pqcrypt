@@ -1,6 +1,5 @@
-use crate::storage::dispatch::determine_type;
-use crate::storage::dispatch::StorageType;
 use crate::storage::Storage;
+use crate::url::parse_pqcrypt_url;
 use anyhow::Result;
 use std::env;
 use std::path::Path;
@@ -9,37 +8,8 @@ use std::process;
 mod cli;
 mod storage;
 mod types;
+mod url;
 mod workers;
-
-#[derive(Debug, Clone)]
-struct ParsedPqcryptUrl {
-    canonical: String,
-    storage_path: String,
-}
-
-fn parse_pqcrypt_url(input: &str) -> ParsedPqcryptUrl {
-    if let Some(rest) = input.strip_prefix("pqcrypt::") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else if let Some(rest) = input.strip_prefix("pqcrypt://") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else if let Some(rest) = input.strip_prefix("pqcrypt:") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", input),
-            storage_path: input.to_string(),
-        }
-    }
-}
 
 fn invoked_as_git_remote_helper(args: &[String]) -> bool {
     if args.len() != 3 {
@@ -96,20 +66,7 @@ async fn run_remote<S: Storage + Clone>(storage: S, remote_url: String) -> Resul
 }
 
 async fn handle_remote(repo_path: &str, remote_url: &str) -> Result<()> {
-    match determine_type(repo_path) {
-        StorageType::Local => {
-            let storage = storage::local::LocalStorage::new(repo_path).await?;
-            run_remote(storage, remote_url.to_string()).await?;
-        }
-        StorageType::Sftp => {
-            let storage = storage::sftp::SftpStorage::new(repo_path).await?;
-            run_remote(storage, remote_url.to_string()).await?;
-        }
-        StorageType::Git => {
-            let storage = storage::git_ssh::GitStorage::new(repo_path).await?;
-            run_remote(storage, remote_url.to_string()).await?;
-        }
-    }
-
-    Ok(())
+    with_storage!(repo_path, storage => {
+        run_remote(storage, remote_url.to_string()).await
+    })
 }

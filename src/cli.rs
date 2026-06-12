@@ -1,8 +1,6 @@
-use crate::storage::dispatch::{determine_type, StorageType};
-use crate::storage::git_ssh::GitStorage;
-use crate::storage::local::LocalStorage;
-use crate::storage::sftp::SftpStorage;
 use crate::storage::Storage;
+use crate::url::parse_pqcrypt_url;
+use crate::with_storage;
 use crate::workers::gitworker;
 use crate::workers::keyworker::{self, InitKeyResult, KeyWorker};
 use anyhow::{anyhow, Context, Result};
@@ -59,36 +57,6 @@ enum Commands {
         /// Path to the existing private key file
         private_key_path: PathBuf,
     },
-}
-
-#[derive(Debug, Clone)]
-struct ParsedPqcryptUrl {
-    canonical: String,
-    storage_path: String,
-}
-
-fn parse_pqcrypt_url(input: &str) -> ParsedPqcryptUrl {
-    if let Some(rest) = input.strip_prefix("pqcrypt::") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else if let Some(rest) = input.strip_prefix("pqcrypt://") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else if let Some(rest) = input.strip_prefix("pqcrypt:") {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", rest),
-            storage_path: rest.to_string(),
-        }
-    } else {
-        ParsedPqcryptUrl {
-            canonical: format!("pqcrypt::{}", input),
-            storage_path: input.to_string(),
-        }
-    }
 }
 
 async fn init_storage<S: Storage + Clone>(
@@ -156,20 +124,10 @@ async fn init_repo(url: String, key_path: Option<PathBuf>, comment: Option<Strin
         None => prompt_for_comment()?,
     };
 
-    match determine_type(&repo_path) {
-        StorageType::Local => {
-            let s = LocalStorage::new(&repo_path).await?;
-            init_storage(s, url.clone(), sk, comment).await?;
-        }
-        StorageType::Sftp => {
-            let s = SftpStorage::new(&repo_path).await?;
-            init_storage(s, url.clone(), sk, comment).await?;
-        }
-        StorageType::Git => {
-            let s = GitStorage::new(&repo_path).await?;
-            init_storage(s, url.clone(), sk, comment).await?;
-        }
-    };
+    with_storage!(&repo_path, storage => {
+        init_storage(storage, url.clone(), sk, comment).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     gitworker::add_pqcrypt_remote(&url)?;
     Ok(())
@@ -180,17 +138,9 @@ async fn add_user_repo(url: String, pubkey: String, comment: String) -> Result<(
     let url = parsed.canonical;
     let repo_path = parsed.storage_path;
 
-    match determine_type(&repo_path) {
-        StorageType::Local => {
-            add_user_to_storage(LocalStorage::new(&repo_path).await?, url, pubkey, comment).await
-        }
-        StorageType::Sftp => {
-            add_user_to_storage(SftpStorage::new(&repo_path).await?, url, pubkey, comment).await
-        }
-        StorageType::Git => {
-            add_user_to_storage(GitStorage::new(&repo_path).await?, url, pubkey, comment).await
-        }
-    }
+    with_storage!(&repo_path, storage => {
+        add_user_to_storage(storage, url, pubkey, comment).await
+    })
 }
 
 pub async fn parse_and_run() -> Result<()> {

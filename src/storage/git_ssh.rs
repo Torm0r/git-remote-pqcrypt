@@ -1,8 +1,8 @@
 use anyhow::anyhow;
-use std::path::PathBuf;
 use tokio::fs;
 use tokio::process::Command;
 
+use crate::storage::local::LocalStorage;
 use crate::storage::{LockGuard, Result, Storage, StorageError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -24,9 +24,14 @@ fn git_cmd() -> Command {
     cmd
 }
 
+/// Git-repo-backed storage that uses a local filesystem cache.
+///
+/// File operations (get/put/list/delete/put_atomic) are delegated to an
+/// embedded `LocalStorage` pointing at the cache directory. `GitStorage`
+/// adds git fetch/push sync on top of that local cache.
 #[derive(Clone)]
 pub struct GitStorage {
-    repo_root: PathBuf,
+    local: LocalStorage,
     remote_url: String,
 }
 
@@ -37,10 +42,13 @@ impl GitStorage {
         })?;
 
         let encoded_name = URL_SAFE_NO_PAD.encode(repo_path);
-        let repo_root = cache_base.join("pqcrypt").join(encoded_name);
+        let cache_path = cache_base.join("pqcrypt").join(encoded_name);
+        let cache_path_str = cache_path.to_string_lossy().to_string();
+
+        let local = LocalStorage::new(&cache_path_str).await?;
 
         let storage = GitStorage {
-            repo_root,
+            local,
             remote_url: repo_path.to_string(),
         };
 
@@ -51,13 +59,14 @@ impl GitStorage {
     /// Ensures the local cache git repo exists and has the correct origin.
     /// Recreates it from scratch if it's missing or corrupted.
     async fn ensure_cache_repo(&self) -> Result<()> {
-        let git_dir = self.repo_root.join(".git");
+        let repo_root = self.local.root();
+        let git_dir = repo_root.join(".git");
 
         // Check if it's a valid git repo
         if git_dir.exists() {
             let check = git_cmd()
                 .args(["rev-parse", "--git-dir"])
-                .current_dir(&self.repo_root)
+                .current_dir(repo_root)
                 .output()
                 .await;
 
@@ -66,7 +75,7 @@ impl GitStorage {
                     // Valid repo — ensure origin is correct
                     let _ = git_cmd()
                         .args(["remote", "set-url", "origin", &self.remote_url])
-                        .current_dir(&self.repo_root)
+                        .current_dir(repo_root)
                         .output()
                         .await;
                     return Ok(());
@@ -75,19 +84,19 @@ impl GitStorage {
                     // Corrupted — remove and recreate
                     eprintln!(
                         "warning: Cache repo corrupted at {}, recreating...",
-                        self.repo_root.display()
+                        repo_root.display()
                     );
-                    fs::remove_dir_all(&self.repo_root).await.ok();
+                    fs::remove_dir_all(repo_root).await.ok();
                 }
             }
         }
 
         // Create fresh cache repo
-        fs::create_dir_all(&self.repo_root).await?;
+        fs::create_dir_all(repo_root).await?;
 
         let status = git_cmd()
             .arg("init")
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -97,27 +106,25 @@ impl GitStorage {
 
         let _ = git_cmd()
             .args(["remote", "add", "origin", &self.remote_url])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await;
 
         Ok(())
     }
 
-    fn full_path(&self, relative: &str) -> PathBuf {
-        self.repo_root.join(relative)
-    }
+    async fn do_push_sync(&self) -> Result<()> {
+        let repo_root = self.local.root();
 
-    pub async fn push_sync(&self) -> Result<()> {
         // Stage each path individually — some may not exist yet (e.g., during init)
         for path in &["keys.json", "manifest.enc", "objects/"] {
-            let full = self.repo_root.join(path);
+            let full = repo_root.join(path);
             if !full.exists() {
                 continue;
             }
             let _ = git_cmd()
                 .args(["add", "--force", path])
-                .current_dir(&self.repo_root)
+                .current_dir(repo_root)
                 .output()
                 .await?;
         }
@@ -125,7 +132,7 @@ impl GitStorage {
         // Check if there's anything staged
         let diff_output = git_cmd()
             .args(["diff", "--cached", "--quiet"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -135,7 +142,7 @@ impl GitStorage {
 
         let commit_output = git_cmd()
             .args(["commit", "-m", "pqcrypt: state update"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -157,7 +164,7 @@ impl GitStorage {
 
         let push_output = git_cmd()
             .args(["push", "origin", "HEAD"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -182,29 +189,32 @@ impl GitStorage {
     /// Remove all tracked and untracked files from the working tree.
     /// Used when the remote is empty so stale cached files don't persist.
     async fn clean_cache(&self) -> Result<()> {
+        let repo_root = self.local.root();
+
         // Remove all tracked files from the index
         let _ = git_cmd()
             .args(["rm", "-rf", "--ignore-unmatch", "."])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await;
 
         // Remove any untracked files and directories
         let _ = git_cmd()
             .args(["clean", "-fdx", "-e", ".git"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await;
 
         Ok(())
     }
 
-    pub async fn fetch_sync(&self) -> Result<()> {
+    async fn do_fetch_sync(&self) -> Result<()> {
+        let repo_root = self.local.root();
         self.ensure_cache_repo().await?;
 
         let fetch_output = git_cmd()
             .args(["fetch", "origin"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -225,7 +235,7 @@ impl GitStorage {
 
         let branch_output = git_cmd()
             .args(["branch", "-r"])
-            .current_dir(&self.repo_root)
+            .current_dir(repo_root)
             .output()
             .await?;
 
@@ -251,7 +261,7 @@ impl GitStorage {
             if let Some(ref_target) = remote_ref {
                 let reset_output = git_cmd()
                     .args(["reset", "--hard", ref_target])
-                    .current_dir(&self.repo_root)
+                    .current_dir(repo_root)
                     .output()
                     .await?;
 
@@ -276,39 +286,25 @@ impl GitStorage {
 }
 
 impl Storage for GitStorage {
+    // Delegate file operations to the embedded LocalStorage
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
-        let full = self.full_path(path);
-        match fs::read(&full).await {
-            Ok(data) => Ok(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
-            Err(e) => Err(StorageError::Io(e)),
-        }
+        self.local.get(path).await
     }
 
     async fn put(&self, path: &str, content: Vec<u8>) -> Result<()> {
-        let full = self.full_path(path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::write(&full, content).await?;
-        Ok(())
+        self.local.put(path, content).await
     }
 
     async fn list(&self, path: &str) -> Result<Vec<String>> {
-        let full = self.full_path(path);
-        if !full.exists() {
-            return Ok(Vec::new());
-        }
-        let mut entries = Vec::new();
-        let mut read_dir = fs::read_dir(&full).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            if let Some(name) = entry.file_name().to_str() {
-                entries.push(name.to_string());
-            }
-        }
-        Ok(entries)
+        self.local.list(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.local.delete(path).await
+    }
+
+    async fn put_atomic(&self, path: &str, content: Vec<u8>) -> Result<()> {
+        self.local.put_atomic(path, content).await
     }
 
     async fn lock(&self) -> Result<LockGuard<Self>> {
@@ -322,31 +318,11 @@ impl Storage for GitStorage {
         Ok(())
     }
 
-    async fn delete(&self, path: &str) -> Result<()> {
-        let full = self.full_path(path);
-        match fs::remove_file(&full).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StorageError::Io(e)),
-        }
-    }
-
-    async fn put_atomic(&self, path: &str, content: Vec<u8>) -> Result<()> {
-        let full = self.full_path(path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let tmp_path = full.with_extension("tmp");
-        fs::write(&tmp_path, content).await?;
-        fs::rename(&tmp_path, &full).await?;
-        Ok(())
-    }
-
     async fn fetch_sync(&self) -> Result<()> {
-        GitStorage::fetch_sync(self).await
+        self.do_fetch_sync().await
     }
 
     async fn push_sync(&self) -> Result<()> {
-        GitStorage::push_sync(self).await
+        self.do_push_sync().await
     }
 }

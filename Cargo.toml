@@ -2,7 +2,7 @@
 name = "git-remote-pqcrypt"
 version = "0.1.0"
 edition = "2024"
-description = "Git remote helper to manage postquantom encrypted repositories"
+description = "Git remote helper to manage postquantum encrypted repositories"
 authors = ["Tormor <170923794+Torm0r@users.noreply.github.com>"]
 license = "GPL-3.0"
 repository = "https://github.com/Torm0r/pqcrypt"

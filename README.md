@@ -23,8 +23,36 @@ objects/
 ```
 `keys.json` contains metadata and encrypted master key wrappings.
 
+## Installation
 
-## Installation 
+### Fast install with Cargo
+
+Install the default build from Git:
+
+```bash
+cargo install --git https://github.com/Torm0r/git-remote-pqcrypt --locked
+```
+
+This installs `git-remote-pqcrypt` to Cargo's binary directory, usually `~/.cargo/bin`.
+
+Make sure Cargo's binary directory is in your `PATH`, then check that it works:
+
+```bash
+git-remote-pqcrypt --help
+```
+
+The default build includes local filesystem and Git-backed storage support.
+
+To install with SFTP support on Unix-like systems:
+
+```bash
+cargo install --git https://github.com/Torm0r/git-remote-pqcrypt --locked --features sftp
+```
+
+The `sftp` feature is currently not supported on Windows.
+
+### Build from source
+
 Build with default backend support:
 
 ```bash
@@ -33,20 +61,22 @@ cargo build --release
 
 This includes local filesystem and Git-backed storage support.
 
-To enable SFTP support on Unix-like systems:
+To build with SFTP support on Unix-like systems:
 
 ```bash
 cargo build --release --features sftp
 ```
 
-The `sftp` feature is currently not supported on Windows.
-Install the binary to your PATH:
+Install the binary to your `PATH`:
+
 ```bash
 sudo cp target/release/git-remote-pqcrypt /usr/local/bin/
 ```
-Name must remain the same since Git finds remote helpers by name `git-remote-[name]`.
 
-Then check if it is working:
+The binary name must remain `git-remote-pqcrypt`, because Git finds remote helpers by looking for `git-remote-[name]`.
+
+Check that it works:
+
 ```bash
 git-remote-pqcrypt --help
 ```

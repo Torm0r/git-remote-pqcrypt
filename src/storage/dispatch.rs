@@ -1,17 +1,34 @@
 pub enum StorageType {
     Local,
+    #[cfg(feature = "sftp")]
     Sftp,
     Git,
 }
 
-pub fn determine_type(url: &str) -> StorageType {
+#[allow(dead_code)]
+#[derive(Debug, thiserror::Error)]
+pub enum StorageDispatchError {
+    #[error("SFTP/SSH backend requested, but this binary was built without the `sftp` feature")]
+    SftpFeatureDisabled,
+}
+
+pub fn determine_type(url: &str) -> Result<StorageType, StorageDispatchError> {
     let url = url.strip_prefix("pqcrypt://").unwrap_or(url);
-    if url.starts_with("sftp://") || url.starts_with("ssh://") {
-        StorageType::Sftp
-    } else if url.starts_with("git@") || url.ends_with(".git") || url.starts_with("https://git") {
-        StorageType::Git
+
+    if url.starts_with("git@") || url.ends_with(".git") || url.starts_with("https://git") {
+        Ok(StorageType::Git)
+    } else if url.starts_with("sftp://") || url.starts_with("ssh://") {
+        #[cfg(feature = "sftp")]
+        {
+            Ok(StorageType::Sftp)
+        }
+
+        #[cfg(not(feature = "sftp"))]
+        {
+            Err(StorageDispatchError::SftpFeatureDisabled)
+        }
     } else {
-        StorageType::Local
+        Ok(StorageType::Local)
     }
 }
 
@@ -29,11 +46,12 @@ pub fn determine_type(url: &str) -> StorageType {
 macro_rules! with_storage {
     ($repo_path:expr, $storage:ident => $body:expr) => {{
         use $crate::storage::dispatch::{StorageType, determine_type};
-        match determine_type($repo_path) {
+        match determine_type($repo_path)? {
             StorageType::Local => {
                 let $storage = $crate::storage::local::LocalStorage::new($repo_path).await?;
                 $body
             }
+            #[cfg(feature = "sftp")]
             StorageType::Sftp => {
                 let $storage = $crate::storage::sftp::SftpStorage::new($repo_path).await?;
                 $body

@@ -15,6 +15,7 @@ pub enum StorageError {
 pub(crate) mod dispatch;
 pub(crate) mod git_ssh;
 pub(crate) mod local;
+#[cfg(feature = "sftp")]
 pub(crate) mod sftp;
 #[allow(dead_code)]
 pub trait Storage: Send + Sync + Clone {

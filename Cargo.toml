@@ -14,6 +14,10 @@ exclude = [
     "benches/*"
 ]
 
+[features]
+default = []
+sftp = ["dep:openssh-sftp-client", "dep:openssh"]
+
 [[bin]]
 name = "git-remote-pqcrypt"
 path = "src/main.rs"
@@ -32,7 +36,7 @@ zeroize = "1.8.2"
 # Keep the git-release, because it's the only one with X-Wing
 hpke = { git = "https://github.com/rozbb/rust-hpke", features = ["xwing"] }
 thiserror = "2.0.18"
-openssh = { version = "0.11", features = ["native-mux"] }
-openssh-sftp-client = { version = "0.15.7", features = ["openssh"] }
+openssh = { version = "0.11", optional = true, features = ["native-mux"] }
+openssh-sftp-client = { version = "0.15.7", optional = true, features = ["openssh"] }
 futures = "0.3"
 dirs = "6.0.0"

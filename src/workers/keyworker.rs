@@ -84,13 +84,15 @@ pub async fn resolve_or_generate_init_key(
 
     let (sk, pk) = Kem::gen_keypair();
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&default_path)
-        .await?;
+    let mut options = OpenOptions::new();
+
+    options.create(true).write(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&default_path).await?;
 
     file.write_all(&sk.to_bytes()).await?;
 

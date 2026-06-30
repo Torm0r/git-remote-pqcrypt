@@ -1,0 +1,81 @@
+name: Rust
+
+on:
+    push:
+        branches:
+            - "main"
+    pull_request:
+        branches:
+            - "main"
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    fmt:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - run: cargo fmt --check
+
+    build:
+        needs: fmt
+        strategy:
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      feature_args: ""
+                      feature_name: core
+                      bin_path: target/release/git-remote-pqcrypt
+
+                    - os: windows-latest
+                      feature_args: ""
+                      feature_name: core
+                      bin_path: target/release/git-remote-pqcrypt.exe
+
+                    - os: macos-latest
+                      feature_args: ""
+                      feature_name: core
+                      bin_path: target/release/git-remote-pqcrypt
+
+                    - os: macos-15-intel
+                      feature_args: ""
+                      feature_name: core
+                      bin_path: target/release/git-remote-pqcrypt
+
+                    - os: ubuntu-latest
+                      feature_args: "--features sftp"
+                      feature_name: sftp
+                      bin_path: target/release/git-remote-pqcrypt
+
+                    - os: macos-latest
+                      feature_args: "--features sftp"
+                      feature_name: sftp
+                      bin_path: target/release/git-remote-pqcrypt
+
+                    - os: macos-15-intel
+                      feature_args: "--features sftp"
+                      feature_name: sftp
+                      bin_path: target/release/git-remote-pqcrypt
+
+        runs-on: ${{ matrix.os }}
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Clippy
+              run: cargo clippy --all-targets ${{ matrix.feature_args }} -- -D warnings
+
+            - name: Test
+              run: cargo test --verbose ${{ matrix.feature_args }}
+
+            - name: Build release binary
+              run: cargo build --release --verbose ${{ matrix.feature_args }}
+
+            - name: Upload binary artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: git-remote-pqcrypt-${{ matrix.os }}-${{ matrix.feature_name }}
+                  path: ${{ matrix.bin_path }}

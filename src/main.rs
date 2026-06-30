@@ -12,6 +12,8 @@ mod url;
 mod workers;
 
 fn invoked_as_git_remote_helper(args: &[String]) -> bool {
+    #[cfg(all(feature = "sftp", not(unix)))]
+    compile_error!("The `sftp` feature is only supported on Unix-like platforms.");
     if args.len() != 3 {
         return false;
     }
